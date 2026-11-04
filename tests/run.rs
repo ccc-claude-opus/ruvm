@@ -230,3 +230,59 @@ fn debian_linux_riscv64_boots_to_shell() {
         assert!(text.contains(want), "missing {want:?} in:\n{text}");
     }
 }
+
+fn same_as_qemu(arch: &str, elf: &str) {
+    let out = String::from_utf8(run_elf(arch, elf)).unwrap();
+    assert_eq!(out, expected(&elf.replace(".elf", ".expected")), "{elf} differs from the qemu-system reference");
+}
+
+/// Every scalar FP instruction (half/single/double) over special operands in all FPCR
+/// rounding modes, hashed with the FPSR flags: identical to qemu-system-aarch64.
+#[test]
+fn aarch64_scalar_fp_matches_qemu_system() {
+    same_as_qemu("aarch64", "a64_fp.elf");
+}
+
+/// ~2000 Advanced SIMD instruction x arrangement groups (integer, FP, narrowing/widening,
+/// shifts, permutes, by-element, scalar forms) over edge-case vectors.
+#[test]
+fn aarch64_neon_matches_qemu_system() {
+    same_as_qemu("aarch64", "a64_neon.elf");
+}
+
+/// Stage-1 MMU: translation / access-flag / permission faults per level, execute-never,
+/// TTBR1, 2 MiB blocks, page-crossing accesses, TBI, LDTR/STTR, DC ZVA, TLBI, EL0 faults.
+#[test]
+fn aarch64_mmu_matches_qemu_system() {
+    same_as_qemu("aarch64", "a64_mmu.elf");
+}
+
+/// GICv2, generic virtual timer, SGI priorities, priority mask, PL011 TX interrupt.
+#[test]
+fn aarch64_interrupts_match_qemu_system() {
+    same_as_qemu("aarch64", "a64_irq.elf");
+}
+
+/// Debian's stock arm64 kernel + installer initrd boots to a busybox shell, runs commands
+/// and powers off through PSCI. Slow (~2 min): `cargo test --release -- --ignored`.
+#[test]
+#[ignore]
+fn debian_linux_aarch64_boots_to_shell() {
+    let dir = format!("{}/tests/guest/out/linux/debian/arm64", env!("CARGO_MANIFEST_DIR"));
+    if !std::path::Path::new(&format!("{dir}/linux")).exists() {
+        eprintln!("skipped: run tools/linux/fetch-debian.sh arm64 first");
+        return;
+    }
+    let out = Command::new(env!("CARGO_BIN_EXE_ruvm"))
+        .args(["-M", "aarch64", "-m", "1024", "-kernel", &format!("{dir}/linux")])
+        .args(["-initrd", &format!("{dir}/initrd.gz"), "-append", "console=ttyAMA0 rdinit=/bin/sh"])
+        .args(["-send-after", "# ", "mount -t proc p /proc; uname -sm; grep -E 'Features|CPU part' /proc/cpuinfo; echo 6*7=$((6*7))\\n"])
+        .args(["-send-after", "=42", "\\npoweroff -f\\n", "-icount", "30000000000"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "did not power off cleanly:\n{text}");
+    for want in ["Run /bin/sh as init process", "Linux aarch64", "fp asimd", "6*7=42", "reboot: Power down"] {
+        assert!(text.contains(want), "missing {want:?} in:\n{text}");
+    }
+}

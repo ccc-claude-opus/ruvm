@@ -1,7 +1,8 @@
 //! Minimal flattened-device-tree (DTB) writer, for describing the board to Linux
 //! and firmware the way QEMU does.
 //!
-//! ```ignore
+//! ```
+//! use ruvm::fdt::Fdt;
 //! let mut t = Fdt::new();
 //! t.begin("");
 //! t.u32("#address-cells", 2);
@@ -11,6 +12,7 @@
 //! t.end();
 //! t.end();
 //! let blob = t.finish();
+//! assert_eq!(&blob[..4], &[0xd0, 0x0d, 0xfe, 0xed]); // FDT magic
 //! ```
 
 const MAGIC: u32 = 0xd00d_feed;

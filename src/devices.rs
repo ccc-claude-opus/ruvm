@@ -196,6 +196,107 @@ impl Device for Uart {
     }
 }
 
+/// ARM PrimeCell PL011 UART with FIFOs modelled as unbounded queues and QEMU's
+/// interrupt behaviour (TX interrupt raised after each transmit, RX when data waits).
+pub struct Pl011 {
+    rx: Option<Receiver<u8>>,
+    script: SharedScript,
+    pending: Option<u8>,
+    ibrd: u32,
+    fbrd: u32,
+    lcrh: u32,
+    cr: u32,
+    ifls: u32,
+    imsc: u32,
+    /// Raw interrupt status bits other than RX/RT (which follow the receive queue).
+    ris: u32,
+}
+
+const PL011_RX: u32 = 1 << 4;
+const PL011_TX: u32 = 1 << 5;
+const PL011_RT: u32 = 1 << 6;
+
+impl Pl011 {
+    pub fn new(rx: Option<Receiver<u8>>, script: SharedScript) -> Self {
+        Pl011 { rx, script, pending: None, ibrd: 0, fbrd: 0, lcrh: 0, cr: 0x300, ifls: 0x12, imsc: 0, ris: PL011_TX }
+    }
+
+    fn rx_ready(&mut self) -> bool {
+        if self.pending.is_none() {
+            self.pending = self.script.lock().unwrap().typed.pop_front();
+        }
+        if self.pending.is_none() {
+            if let Some(rx) = &self.rx {
+                self.pending = rx.try_recv().ok();
+            }
+        }
+        self.pending.is_some()
+    }
+
+    fn raw(&mut self) -> u32 {
+        let rx = if self.rx_ready() { PL011_RX | PL011_RT } else { 0 };
+        self.ris | rx
+    }
+}
+
+impl Device for Pl011 {
+    fn read(&mut self, off: u64, _size: usize) -> u64 {
+        (match off {
+            0x00 => {
+                self.rx_ready();
+                self.pending.take().unwrap_or(0) as u32
+            }
+            0x04 => 0,
+            0x18 => {
+                // FR: TXFE always, RXFE when nothing waits
+                0x90 & !(if self.rx_ready() { 0x10 } else { 0 })
+            }
+            0x24 => self.ibrd,
+            0x28 => self.fbrd,
+            0x2c => self.lcrh,
+            0x30 => self.cr,
+            0x34 => self.ifls,
+            0x38 => self.imsc,
+            0x3c => self.raw(),
+            0x40 => self.raw() & self.imsc,
+            0xfe0 => 0x11,
+            0xfe4 => 0x10,
+            0xfe8 => 0x14,
+            0xfec => 0x00,
+            0xff0 => 0x0d,
+            0xff4 => 0xf0,
+            0xff8 => 0x05,
+            0xffc => 0xb1,
+            _ => 0,
+        }) as u64
+    }
+
+    fn write(&mut self, off: u64, _size: usize, val: u64) {
+        let v = val as u32;
+        match off {
+            0x00 => {
+                let mut out = std::io::stdout().lock();
+                let _ = out.write_all(&[v as u8]);
+                let _ = out.flush();
+                self.script.lock().unwrap().output(v as u8);
+                self.ris |= PL011_TX;
+            }
+            0x24 => self.ibrd = v & 0xffff,
+            0x28 => self.fbrd = v & 0x3f,
+            0x2c => self.lcrh = v & 0xff,
+            0x30 => self.cr = v & 0xffff,
+            0x34 => self.ifls = v & 0x3f,
+            0x38 => self.imsc = v & 0x7ff,
+            0x44 => self.ris &= !v,
+            _ => {}
+        }
+    }
+
+    fn irq(&mut self) -> bool {
+        self.raw() & self.imsc != 0
+    }
+}
+
 /// SiFive "test finisher" — QEMU's `virt` board uses it for power-off.
 /// 0x5555 = pass, (code << 16) | 0x3333 = fail(code), 0x7777 = reset.
 #[derive(Default)]

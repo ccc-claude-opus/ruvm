@@ -1,14 +1,16 @@
-//! AArch64 (ARMv8-A, A64) integer subset, single core, flat physical memory.
+//! AArch64 (ARMv8-A, A64): integer, scalar FP and Advanced SIMD, EL0/EL1, stage-1 MMU,
+//! generic timer and GIC interrupts; single core.
 //!
 //! Supported: data-processing (immediate & register), bitfield/extract, move-wide,
 //! ADR/ADRP, all integer loads/stores (imm, register offset, pre/post-index, pairs,
 //! literal), branches, CSEL family, CCMP/CCMN, MUL/DIV/MADD, CLZ/REV/RBIT,
 //! NOP/barriers, exclusives (LDXR/STXR/LDXP/STXP), load-acquire/store-release,
-//! LSE atomics (LDADD.., SWP, CAS), HVC/SMC (PSCI power-off).
+//! LSE atomics (LDADD.., SWP, CAS), HVC/SMC (PSCI), scalar FP (`fp`), Advanced SIMD (`neon`).
 //! Exception levels EL0/EL1: VBAR_EL1 vectors, ESR/ELR/SPSR/FAR_EL1, ERET, SP_EL0/SP_EL1,
 //! DAIF, synchronous exceptions (SVC, BRK, undefined, data/instruction abort).
 //! While VBAR_EL1 is 0, SVC is a host syscall and faults stop the VM (bare programs).
-//! Not supported: SIMD/FP, MMU, interrupts (GIC), EL2/EL3.
+//! Stage-1 MMU (4 KiB granule, see `mmu`), TLB, cache/TLB maintenance instructions.
+//! Not supported: EL2/EL3, 16K/64K granules, hardware A/D updates.
 
 use super::{sext, Cpu};
 use crate::bus::Bus;
@@ -16,6 +18,12 @@ use crate::devices::Clint;
 use crate::host::{self, Host};
 use crate::machine::Stop;
 use std::collections::HashMap;
+
+mod fp;
+mod mmu;
+mod neon;
+mod simd;
+use mmu::TlbEntry;
 
 /// System-register key: the o0:op1:CRn:CRm:op2 field of MRS/MSR (bits 19:5).
 const fn sr(op0: u32, op1: u32, crn: u32, crm: u32, op2: u32) -> u32 {
@@ -33,10 +41,44 @@ const SYS_FAR_EL1: u32 = sr(3, 0, 6, 0, 0);
 const SYS_VBAR_EL1: u32 = sr(3, 0, 12, 0, 0);
 const SYS_MIDR_EL1: u32 = sr(3, 0, 0, 0, 0);
 const SYS_MPIDR_EL1: u32 = sr(3, 0, 0, 0, 5);
-const SYS_ID_AA64ISAR0_EL1: u32 = sr(3, 0, 0, 6, 0);
 const SYS_CNTFRQ_EL0: u32 = sr(3, 3, 14, 0, 0);
 const SYS_CNTPCT_EL0: u32 = sr(3, 3, 14, 0, 1);
 const SYS_CNTVCT_EL0: u32 = sr(3, 3, 14, 0, 2);
+const SYS_CNTP_TVAL: u32 = sr(3, 3, 14, 2, 0);
+const SYS_CNTP_CTL: u32 = sr(3, 3, 14, 2, 1);
+const SYS_CNTP_CVAL: u32 = sr(3, 3, 14, 2, 2);
+const SYS_CNTV_TVAL: u32 = sr(3, 3, 14, 3, 0);
+const SYS_CNTV_CTL: u32 = sr(3, 3, 14, 3, 1);
+const SYS_CNTV_CVAL: u32 = sr(3, 3, 14, 3, 2);
+const SYS_SCTLR_EL1: u32 = sr(3, 0, 1, 0, 0);
+const SYS_TTBR0_EL1: u32 = sr(3, 0, 2, 0, 0);
+const SYS_TTBR1_EL1: u32 = sr(3, 0, 2, 0, 1);
+const SYS_TCR_EL1: u32 = sr(3, 0, 2, 0, 2);
+const SYS_REVIDR_EL1: u32 = sr(3, 0, 0, 0, 6);
+const SYS_CTR_EL0: u32 = sr(3, 3, 0, 0, 1);
+const SYS_DCZID_EL0: u32 = sr(3, 3, 0, 0, 7);
+const SYS_CLIDR_EL1: u32 = sr(3, 1, 0, 0, 1);
+const fn sr_cntkctl() -> u32 {
+    sr(3, 0, 14, 1, 0)
+}
+const SYS_FPCR: u32 = sr(3, 3, 4, 4, 0);
+const SYS_FPSR: u32 = sr(3, 3, 4, 4, 1);
+
+/// ID_AA64* / ID_* register values (read-only). A Cortex-A57 r1p3-like CPU without
+/// EL2/EL3, crypto, PMU, SVE, pointer authentication or hardware A/D updates.
+fn id_reg(key: u32) -> Option<u64> {
+    const fn r(crm: u32, op2: u32) -> u32 {
+        sr(3, 0, 0, crm, op2)
+    }
+    Some(match key {
+        k if k == r(4, 0) => 0x0000_0000_0000_0011, // ID_AA64PFR0: EL0/EL1 = AArch64, FP + AdvSIMD present
+        k if k == r(5, 0) => 0x0000_0000_0000_0006, // ID_AA64DFR0: ARMv8.0 debug, no PMU
+        k if k == r(7, 0) => 0x0000_0000_0f00_0022, // ID_AA64MMFR0: 40-bit PA, 16-bit ASID, 4K granule only
+        // everything else in the ID block (PFR1, DFR1, AFR, ISAR0-2, MMFR1-2, ZFR0, AArch32 regs) reads as 0
+        k if k >> 14 == 1 && (k >> 11) & 7 == 0 && (k >> 7) & 15 == 0 && (k >> 3) & 15 >= 1 => 0,
+        _ => return None,
+    })
+}
 
 // exception classes (ESR_ELx.EC)
 const EC_UNKNOWN: u32 = 0x00;
@@ -75,6 +117,32 @@ pub struct Aarch64 {
     /// Exclusive monitor: (address, size) of the last LDXR.
     excl: Option<(u64, usize)>,
     sysregs: HashMap<u32, u64>,
+    // MMU
+    sctlr: u64,
+    tcr: u64,
+    ttbr0: u64,
+    ttbr1: u64,
+    asid: u16,
+    tlb: Vec<TlbEntry>,
+    tlb_gen: u32,
+    /// Instruction-fetch fast path: VPN + 1 of the current code page, RAM offset of the page.
+    fetch_vpn: u64,
+    fetch_off: usize,
+    fetch_el: u32,
+    /// Next data access is an unprivileged one (LDTR/STTR).
+    unpriv: bool,
+    /// Generic timers: [0] = physical (CNTP), [1] = virtual (CNTV): (ctl, cval).
+    timer: [(u64, u64); 2],
+    /// `mtime` value at which a timer comparator next changes state.
+    timer_deadline: u64,
+    cntkctl: u64,
+    fpcr: u32,
+    fpsr: u32,
+    /// SIMD & FP register file (scalar B/H/S/D/Q registers are the low bits).
+    vr: [u128; 32],
+    /// Debug aid (env RUVM_LOG_UNDEF): log every undefined-instruction exception.
+    log_undef: bool,
+    last_insn: u32,
 }
 
 fn ones(n: u32) -> u64 {
@@ -187,6 +255,31 @@ impl Aarch64 {
             sp_other: 0,
             excl: None,
             sysregs: HashMap::new(),
+            sctlr: 0x30d0_0800, // RES1 bits
+            tcr: 0,
+            ttbr0: 0,
+            ttbr1: 0,
+            asid: 0,
+            tlb: vec![TlbEntry::default(); mmu::TLB_SIZE],
+            tlb_gen: 1,
+            fetch_vpn: 0,
+            fetch_off: 0,
+            fetch_el: 0,
+            unpriv: false,
+            timer: [(0, 0); 2],
+            timer_deadline: u64::MAX,
+            cntkctl: 0,
+            fpcr: 0,
+            fpsr: 0,
+            vr: [0; 32],
+            log_undef: std::env::var_os("RUVM_LOG_UNDEF").is_some(),
+            last_insn: 0,
+        }
+    }
+
+    pub fn set_reg(&mut self, r: usize, v: u64) {
+        if r < 31 {
+            self.x[r] = v;
         }
     }
 
@@ -239,11 +332,129 @@ impl Aarch64 {
     fn abort(&self, addr: u64, write: bool) -> Ex {
         Ex::Sync { ec: EC_DABORT_LOWER, iss: 0x10 | (write as u32) << 6, far: Some(addr), next: false }
     }
-    fn rd(&self, bus: &mut Bus, addr: u64, n: usize) -> Result<u64, Ex> {
-        bus.read(addr, n).map_err(|_| self.abort(addr, false))
+    /// Recompute timer interrupt lines (PPI 30 = physical, PPI 27 = virtual) and the
+    /// next time anything about them changes.
+    fn update_timers(&mut self, bus: &mut Bus) {
+        let now = bus.clint.mtime;
+        let mut deadline = u64::MAX;
+        for (k, ppi) in [30u32, 27].into_iter().enumerate() {
+            let (ctl, cval) = self.timer[k];
+            let enabled = ctl & 1 == 1;
+            let met = now >= cval;
+            let line = enabled && ctl & 2 == 0 && met;
+            bus.gic.set_level(ppi, line);
+            if enabled && !met {
+                deadline = deadline.min(cval);
+            }
+        }
+        self.timer_deadline = deadline;
     }
-    fn wr(&self, bus: &mut Bus, addr: u64, n: usize, v: u64) -> Result<(), Ex> {
-        bus.write(addr, n, v).map_err(|_| self.abort(addr, true))
+
+    fn timer_ctl(&self, k: usize, now: u64) -> u64 {
+        let (ctl, cval) = self.timer[k];
+        (ctl & 3) | ((ctl & 1 == 1 && now >= cval) as u64) << 2
+    }
+
+    fn sysreg_read(&mut self, bus: &mut Bus, key: u32) -> u64 {
+        let now = bus.clint.mtime;
+        if let Some(v) = id_reg(key) {
+            return v;
+        }
+        match key {
+            SYS_NZCV => self.nzcv(),
+            SYS_DAIF => (self.daif as u64) << 6,
+            SYS_CURRENT_EL => (self.el as u64) << 2,
+            SYS_SPSEL => self.spsel as u64,
+            SYS_SP_EL0 => self.sp_el0(),
+            SYS_MIDR_EL1 => 0x411f_d073, // Cortex-A57 r1p3
+            SYS_MPIDR_EL1 => 0x8000_0000,
+            SYS_REVIDR_EL1 => 0,
+            SYS_CTR_EL0 => 0x8444_c004,
+            SYS_DCZID_EL0 => 4, // DC ZVA allowed, 64-byte blocks
+            SYS_CLIDR_EL1 => 0,
+            SYS_CNTFRQ_EL0 => Clint::FREQ,
+            SYS_CNTPCT_EL0 | SYS_CNTVCT_EL0 => now,
+            SYS_CNTP_CTL => self.timer_ctl(0, now),
+            SYS_CNTV_CTL => self.timer_ctl(1, now),
+            SYS_CNTP_CVAL => self.timer[0].1,
+            SYS_CNTV_CVAL => self.timer[1].1,
+            SYS_CNTP_TVAL => self.timer[0].1.wrapping_sub(now) as u32 as u64,
+            SYS_CNTV_TVAL => self.timer[1].1.wrapping_sub(now) as u32 as u64,
+            sr if sr == sr_cntkctl() => self.cntkctl,
+            SYS_SCTLR_EL1 => self.sctlr,
+            SYS_TTBR0_EL1 => self.ttbr0,
+            SYS_TTBR1_EL1 => self.ttbr1,
+            SYS_TCR_EL1 => self.tcr,
+            SYS_FPCR => self.fpcr as u64,
+            SYS_FPSR => self.fpsr as u64,
+            _ => self.sysreg(key),
+        }
+    }
+
+    fn sysreg_write(&mut self, bus: &mut Bus, key: u32, v: u64) {
+        let now = bus.clint.mtime;
+        match key {
+            SYS_NZCV => self.set_flags((v >> 31 & 1 == 1, v >> 30 & 1 == 1, v >> 29 & 1 == 1, v >> 28 & 1 == 1)),
+            SYS_DAIF => self.daif = (v >> 6) as u32 & 0xf,
+            SYS_SPSEL => self.set_mode(self.el, v & 1 == 1),
+            SYS_SP_EL0 => self.set_sp_el0(v),
+            SYS_CURRENT_EL | SYS_MIDR_EL1 | SYS_MPIDR_EL1 | SYS_CNTPCT_EL0 | SYS_CNTVCT_EL0 => {}
+            SYS_CNTP_CTL | SYS_CNTV_CTL => {
+                let k = (key == SYS_CNTV_CTL) as usize;
+                self.timer[k].0 = v & 3;
+                self.update_timers(bus);
+            }
+            SYS_CNTP_CVAL | SYS_CNTV_CVAL => {
+                self.timer[(key == SYS_CNTV_CVAL) as usize].1 = v;
+                self.update_timers(bus);
+            }
+            SYS_CNTP_TVAL | SYS_CNTV_TVAL => {
+                self.timer[(key == SYS_CNTV_TVAL) as usize].1 = now.wrapping_add(v as u32 as i32 as i64 as u64);
+                self.update_timers(bus);
+            }
+            sr if sr == sr_cntkctl() => self.cntkctl = v,
+            SYS_SCTLR_EL1 => {
+                self.sctlr = v;
+                self.flush_tlb();
+            }
+            SYS_TCR_EL1 => {
+                self.tcr = v;
+                self.update_asid();
+                self.flush_tlb();
+            }
+            SYS_TTBR0_EL1 => {
+                self.ttbr0 = v;
+                self.update_asid();
+            }
+            SYS_TTBR1_EL1 => {
+                self.ttbr1 = v;
+                self.update_asid();
+            }
+            SYS_FPCR => self.fpcr = v as u32 & 0x07ff_9f00,
+            SYS_FPSR => self.fpsr = v as u32 & 0xf800_009f,
+            _ => {
+                self.sysregs.insert(key, v);
+            }
+        }
+    }
+
+    /// SYS instruction (DC / IC / TLBI / AT): cache maintenance is a no-op (the emulated
+    /// memory is always coherent); TLB maintenance flushes the TLB.
+    fn sys_insn(&mut self, bus: &mut Bus, i: u32) -> Result<(), Ex> {
+        let (op1, crn, crm, op2, rt) = ((i >> 16) & 7, (i >> 12) & 15, (i >> 8) & 15, (i >> 5) & 7, (i & 31) as usize);
+        match (op1, crn, crm, op2) {
+            (3, 7, 4, 1) => {
+                let a = self.rz(rt);
+                self.dc_zva(bus, a)?;
+            }
+            (_, 8, _, _) | (_, 7, 5, _) | (_, 7, 1, _) => {
+                if crn == 8 {
+                    self.flush_tlb();
+                }
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     fn undef(&self, _i: u32) -> Ex {
@@ -279,6 +490,21 @@ impl Aarch64 {
 
     fn sysreg(&self, key: u32) -> u64 {
         *self.sysregs.get(&key).unwrap_or(&0)
+    }
+
+    /// Take an IRQ exception to EL1 (the return address is the interrupted instruction).
+    fn irq_exception(&mut self) {
+        let offset = match (self.el, self.spsel) {
+            (1, false) => 0x080,
+            (1, true) => 0x280,
+            _ => 0x480,
+        };
+        self.sysregs.insert(SYS_SPSR_EL1, self.pstate());
+        self.sysregs.insert(SYS_ELR_EL1, self.pc);
+        self.excl = None;
+        self.daif = 0xf;
+        self.set_mode(1, true);
+        self.pc = self.sysreg(SYS_VBAR_EL1).wrapping_add(offset);
     }
 
     /// Take a synchronous exception to EL1.
@@ -446,8 +672,8 @@ impl Aarch64 {
 
     fn exec(&mut self, bus: &mut Bus) -> Result<(), Ex> {
         let pc = self.pc;
-        let i = bus.read(pc, 4).map_err(|_| Ex::Sync { ec: EC_IABORT_LOWER, iss: 0x10, far: Some(pc), next: false })?
-            as u32;
+        let i = self.fetch(bus)?;
+        self.last_insn = i;
         let mut next = pc.wrapping_add(4);
 
         let sf = i >> 31 == 1;
@@ -640,10 +866,18 @@ impl Aarch64 {
                 let res = match (opcode, sf) {
                     (0, true) => a.reverse_bits(),
                     (0, false) => (a as u32).reverse_bits() as u64,
+                    // REV16: swap the bytes of each halfword
+                    (1, true) => ((a & 0x00ff_00ff_00ff_00ff) << 8) | ((a >> 8) & 0x00ff_00ff_00ff_00ff),
+                    (1, false) => ((a as u32 & 0x00ff_00ff) << 8 | (a as u32 >> 8) & 0x00ff_00ff) as u64,
                     (2, false) => (a as u32).swap_bytes() as u64,
+                    // REV32 (64-bit form): swap bytes within each word
+                    (2, true) => ((a as u32).swap_bytes() as u64) | (((a >> 32) as u32).swap_bytes() as u64) << 32,
                     (3, true) => a.swap_bytes(),
                     (4, true) => a.leading_zeros() as u64,
                     (4, false) => (a as u32).leading_zeros() as u64,
+                    // CLS: leading bits equal to the sign bit (not counting the sign bit itself)
+                    (5, true) => ((a ^ (a >> 1)).leading_zeros() as u64).saturating_sub(1).min(63),
+                    (5, false) => (((a as u32) ^ ((a as u32) >> 1)).leading_zeros() as u64).saturating_sub(1).min(31),
                     _ => return Err(self.undef(i)),
                 };
                 self.wz(rd, res, sf);
@@ -700,22 +934,27 @@ impl Aarch64 {
         } else if i & 0x3f20_0c00 == 0x3820_0000 {
             // ---- LSE atomics: LDADD/LDCLR/LDEOR/LDSET/LD{S,U}{MAX,MIN}, SWP, LDAPR
             self.atomic(bus, i)?;
-        } else if i & 0x3e00_0000 == 0x3800_0000 {
-            // ---- LDR/STR family (single register, integer)
-            let size = i >> 30;
+        } else if i & 0x3a00_0000 == 0x3800_0000 {
+            // ---- LDR/STR family (single register, integer or SIMD&FP)
+            let fp = (i >> 26) & 1 == 1;
+            // SIMD&FP 128-bit accesses are scaled by 16
+            let size = if fp && (i >> 23) & 1 == 1 && i >> 30 == 0 { 4 } else { i >> 30 };
             let base = self.rs(rn);
             if (i >> 24) & 1 == 1 {
                 let addr = base.wrapping_add((((i >> 10) & 0xfff) as u64) << size);
-                self.ldst(bus, i, addr)?;
+                if fp { self.fp_ldst(bus, i, addr)? } else { self.ldst(bus, i, addr)? };
             } else if (i >> 21) & 1 == 0 {
                 let imm9 = sext(((i >> 12) & 0x1ff) as u64, 9);
                 let (addr, wb) = match (i >> 10) & 3 {
                     0 => (base.wrapping_add(imm9), None),
                     1 => (base, Some(base.wrapping_add(imm9))),
                     3 => (base.wrapping_add(imm9), Some(base.wrapping_add(imm9))),
-                    _ => return Err(self.undef(i)),
+                    _ => (base.wrapping_add(imm9), None), // LDTR / STTR: EL0 permissions
                 };
-                self.ldst(bus, i, addr)?;
+                self.unpriv = (i >> 10) & 3 == 2;
+                let r = if fp { self.fp_ldst(bus, i, addr) } else { self.ldst(bus, i, addr) };
+                self.unpriv = false;
+                r?;
                 if let Some(w) = wb {
                     self.ws(rn, w, true);
                 }
@@ -724,10 +963,17 @@ impl Aarch64 {
                 if (i >> 12) & 1 == 1 {
                     off <<= size;
                 }
-                self.ldst(bus, i, base.wrapping_add(off))?;
+                let addr = base.wrapping_add(off);
+                if fp { self.fp_ldst(bus, i, addr)? } else { self.ldst(bus, i, addr)? };
             } else {
                 return Err(self.undef(i));
             }
+        } else if i & 0x3e00_0000 == 0x2c00_0000 {
+            self.fp_pair(bus, i)?; // LDP / STP (SIMD&FP)
+        } else if i & 0xbf00_0000 == 0x0c00_0000 || i & 0xbf00_0000 == 0x0d00_0000 {
+            self.simd_structure(bus, i)?; // LD1-LD4 / ST1-ST4
+        } else if i & 0x3f00_0000 == 0x1c00_0000 {
+            self.fp_literal(bus, i)?; // LDR (literal), SIMD&FP
         } else if i & 0x3e00_0000 == 0x2800_0000 {
             // ---- LDP / STP / LDPSW
             let opc = i >> 30;
@@ -741,9 +987,8 @@ impl Aarch64 {
             let base = self.rs(rn);
             let (addr, wb) = match (i >> 23) & 3 {
                 1 => (base, Some(base.wrapping_add(off))),
-                2 => (base.wrapping_add(off), None),
-                3 => (base.wrapping_add(off), Some(base.wrapping_add(off))),
-                _ => return Err(self.undef(i)),
+                0 | 2 => (base.wrapping_add(off), None), // 0 = STNP / LDNP (non-temporal hint ignored)
+                _ => (base.wrapping_add(off), Some(base.wrapping_add(off))),
             };
             let n = 1usize << scale;
             if load {
@@ -777,8 +1022,13 @@ impl Aarch64 {
             }
         } else if i & 0xffff_f0ff == 0xd503_305f {
             self.excl = None; // CLREX
+        } else if i == 0xd503_207f {
+            // ---- WFI: sleep until the next interrupt or timer deadline
+            if !bus.gic.irq_line {
+                bus.idle(self.timer_deadline);
+            }
         } else if i & 0xfffff01f == 0xd503201f || i & 0xfffff01f == 0xd503301f {
-            // ---- NOP / hints (WFI, WFE, YIELD...) / barriers
+            // ---- NOP / hints (WFE, YIELD...) / barriers
         } else if i & 0xfff8f01f == 0xd500401f {
             // ---- MSR (immediate): DAIFSet / DAIFClr / SPSel; others (PAN, UAO...) ignored
             let (op1, op2, crm) = ((i >> 16) & 7, (i >> 5) & 7, (i >> 8) & 15);
@@ -789,6 +1039,8 @@ impl Aarch64 {
                 (0, 5) => self.set_mode(self.el, crm & 1 == 1),
                 _ => {}
             }
+        } else if i & 0xfff8_0000 == 0xd508_0000 {
+            self.sys_insn(bus, i)?;
         } else if i & 0xffd0_0000 == 0xd510_0000 {
             // ---- MRS / MSR (register)
             let key = (i >> 5) & 0x7fff;
@@ -796,34 +1048,11 @@ impl Aarch64 {
                 return Err(self.undef(i)); // only op1 = 3 (EL0-accessible) registers
             }
             if (i >> 21) & 1 == 1 {
-                let v = match key {
-                    SYS_NZCV => self.nzcv(),
-                    SYS_DAIF => (self.daif as u64) << 6,
-                    SYS_CURRENT_EL => (self.el as u64) << 2,
-                    SYS_SPSEL => self.spsel as u64,
-                    SYS_SP_EL0 => self.sp_el0(),
-                    SYS_MIDR_EL1 => 0x410f_d034, // Cortex-A53
-                    SYS_MPIDR_EL1 => 0x8000_0000,
-                    SYS_ID_AA64ISAR0_EL1 => 2 << 20, // LSE atomics
-                    SYS_CNTFRQ_EL0 => Clint::FREQ,
-                    SYS_CNTPCT_EL0 | SYS_CNTVCT_EL0 => bus.clint.mtime,
-                    _ => self.sysreg(key),
-                };
+                let v = self.sysreg_read(bus, key);
                 self.wz(rd, v, true);
             } else {
                 let v = self.rz(rd);
-                match key {
-                    SYS_NZCV => {
-                        self.set_flags((v >> 31 & 1 == 1, v >> 30 & 1 == 1, v >> 29 & 1 == 1, v >> 28 & 1 == 1))
-                    }
-                    SYS_DAIF => self.daif = (v >> 6) as u32 & 0xf,
-                    SYS_SPSEL => self.set_mode(self.el, v & 1 == 1),
-                    SYS_SP_EL0 => self.set_sp_el0(v),
-                    SYS_CURRENT_EL | SYS_MIDR_EL1 | SYS_MPIDR_EL1 | SYS_CNTPCT_EL0 | SYS_CNTVCT_EL0 => {}
-                    _ => {
-                        self.sysregs.insert(key, v);
-                    }
-                }
+                self.sysreg_write(bus, key, v);
             }
         } else if i == 0xd69f_03e0 {
             // ---- ERET
@@ -858,6 +1087,8 @@ impl Aarch64 {
         } else if i & 0xffe0_001f == 0xd440_0000 {
             // ---- HLT: stop the VM, exit code = x0
             return Err(Stop::Halt(self.x[0] as i32).into());
+        } else if (i >> 25) & 7 == 7 {
+            self.fpsimd(bus, i)?; // scalar FP and Advanced SIMD data processing
         } else if i & 0xffe0_001f == 0xd420_0000 {
             // ---- BRK
             return Err(Ex::Sync { ec: EC_BRK, iss: (i >> 5) & 0xffff, far: None, next: false });
@@ -890,6 +1121,13 @@ impl Cpu for Aarch64 {
         self.pc = pc;
     }
     fn step(&mut self, bus: &mut Bus) -> Result<(), Stop> {
+        if bus.clint.mtime >= self.timer_deadline {
+            self.update_timers(bus);
+        }
+        if bus.gic.irq_line && self.daif & 2 == 0 && self.sysreg(SYS_VBAR_EL1) != 0 {
+            self.irq_exception();
+            return Ok(());
+        }
         match self.exec(bus) {
             Ok(()) => Ok(()),
             Err(Ex::Stop(s)) => Err(s),
@@ -904,6 +1142,9 @@ impl Cpu for Aarch64 {
                             ec, iss, far.unwrap_or(0), self.pc
                         ),
                     }));
+                }
+                if ec == EC_UNKNOWN && self.log_undef {
+                    eprintln!("[undef] EL{} pc={:#x} insn={:08x}", self.el, self.pc, self.last_insn);
                 }
                 let ret = if next { self.pc.wrapping_add(4) } else { self.pc };
                 self.exception(ec, iss, far, ret);

@@ -14,6 +14,7 @@ pub mod cpu;
 pub mod demo;
 pub mod devices;
 pub mod fdt;
+pub mod gic;
 pub mod host;
 pub mod machine;
 pub mod virtio;

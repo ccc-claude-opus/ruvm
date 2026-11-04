@@ -2,7 +2,7 @@
 
 use crate::bus::Bus;
 use crate::cpu::{aarch64::Aarch64, riscv::Riscv64, Cpu};
-use crate::devices::{forward_stdin, Clint, SharedScript, TestFinisher, Uart, UartKind};
+use crate::devices::{forward_stdin, Clint, Pl011, SharedScript, TestFinisher, Uart, UartKind};
 use crate::fdt::Fdt;
 use std::sync::mpsc::{channel, Sender};
 use crate::virtio::VirtioBlk;
@@ -100,7 +100,8 @@ impl Machine {
                 Box::new(Riscv64::new())
             }
             Arch::Aarch64 => {
-                bus.map(0x0900_0000, 0x1000, Box::new(Uart::new(UartKind::Pl011, rx, script.clone())));
+                bus.map_gic(0x0800_0000);
+                bus.map_irq(0x0900_0000, 0x1000, 33, Box::new(Pl011::new(rx, script.clone())));
                 Box::new(Aarch64::new())
             }
         };
@@ -143,7 +144,7 @@ impl Machine {
         self.has_disk = true;
         match self.arch {
             Arch::Riscv64 => self.bus.map_irq(0x1000_1000, 0x1000, 1, Box::new(dev)),
-            Arch::Aarch64 => return Err("virtio disks are not wired up on aarch64 yet".into()),
+            Arch::Aarch64 => self.bus.map_irq(0x0a00_0000, 0x200, 48, Box::new(dev)),
         }
         Ok(())
     }
@@ -246,7 +247,71 @@ impl Machine {
                 t.u32("value", 0x7777);
                 t.end();
             }
-            Arch::Aarch64 => unimplemented!("aarch64 device tree"),
+            Arch::Aarch64 => {
+                t.str("compatible", "linux,dummy-virt");
+                t.u32("interrupt-parent", 1);
+                t.begin("chosen");
+                t.str("bootargs", cmdline);
+                t.str("stdout-path", "/pl011@9000000");
+                if let Some((s, e)) = initrd {
+                    t.u64("linux,initrd-start", s);
+                    t.u64("linux,initrd-end", e);
+                }
+                t.end();
+                t.begin("memory@40000000");
+                t.str("device_type", "memory");
+                t.u64s("reg", &[0x4000_0000, ram]);
+                t.end();
+                t.begin("psci");
+                t.strs("compatible", &["arm,psci-1.0", "arm,psci-0.2", "arm,psci"]);
+                t.str("method", "hvc");
+                t.end();
+                t.begin("cpus");
+                t.u32("#address-cells", 1);
+                t.u32("#size-cells", 0);
+                t.begin("cpu@0");
+                t.str("device_type", "cpu");
+                t.str("compatible", "arm,cortex-a57");
+                t.u32("reg", 0);
+                t.str("enable-method", "psci");
+                t.end();
+                t.end();
+                t.begin("interrupt-controller@8000000");
+                t.str("compatible", "arm,cortex-a15-gic");
+                t.u32("#interrupt-cells", 3);
+                t.empty("interrupt-controller");
+                t.u64s("reg", &[0x0800_0000, 0x1_0000, 0x0801_0000, 0x1_0000]);
+                t.u32("phandle", 1);
+                t.end();
+                t.begin("timer");
+                t.str("compatible", "arm,armv8-timer");
+                t.empty("always-on");
+                // secure phys (13), non-secure phys (14), virtual (11), hypervisor (10); level low
+                t.u32s("interrupts", &[1, 13, 0xf08, 1, 14, 0xf08, 1, 11, 0xf08, 1, 10, 0xf08]);
+                t.end();
+                t.begin("apb-pclk");
+                t.str("compatible", "fixed-clock");
+                t.u32("#clock-cells", 0);
+                t.u32("clock-frequency", 24_000_000);
+                t.str("clock-output-names", "clk24mhz");
+                t.u32("phandle", 2);
+                t.end();
+                t.begin("pl011@9000000");
+                t.strs("compatible", &["arm,pl011", "arm,primecell"]);
+                t.u64s("reg", &[0x0900_0000, 0x1000]);
+                t.u32s("interrupts", &[0, 1, 4]);
+                t.u32s("clocks", &[2, 2]);
+                t.strs("clock-names", &["uartclk", "apb_pclk"]);
+                t.end();
+                if self.has_disk {
+                    t.begin("virtio_mmio@a000000");
+                    t.str("compatible", "virtio,mmio");
+                    t.u64s("reg", &[0x0a00_0000, 0x200]);
+                    t.u32s("interrupts", &[0, 16, 1]);
+                    t.empty("dma-coherent");
+                    t.end();
+                }
+            }
         }
         t.end();
         t.finish()
@@ -262,17 +327,40 @@ impl Machine {
         let kernel_addr = base + if text_offset == 0 { 0x20_0000 } else { text_offset };
         self.bus.load(kernel_addr, &b.kernel)?;
 
-        let dtb_addr = (ram_end - 0x10_0000) & !0xffff; // 1 MiB reserved at the top
-        let initrd = match &b.initrd {
-            Some(data) => {
-                let start = (dtb_addr - data.len() as u64) & !0xfff;
-                if start < kernel_addr + b.kernel.len() as u64 + 0x100_0000 {
-                    return Err("initrd does not fit in RAM (try a larger -m)".into());
-                }
-                self.bus.load(start, data)?;
-                Some((start, start + data.len() as u64))
+        let (dtb_addr, initrd) = match self.arch {
+            Arch::Riscv64 => {
+                let dtb_addr = (ram_end - 0x10_0000) & !0xffff; // 1 MiB reserved at the top
+                let initrd = match &b.initrd {
+                    Some(data) => {
+                        let start = (dtb_addr - data.len() as u64) & !0xfff;
+                        if start < kernel_addr + b.kernel.len() as u64 + 0x100_0000 {
+                            return Err("initrd does not fit in RAM (try a larger -m)".into());
+                        }
+                        self.bus.load(start, data)?;
+                        Some((start, start + data.len() as u64))
+                    }
+                    None => None,
+                };
+                (dtb_addr, initrd)
             }
-            None => None,
+            Arch::Aarch64 => {
+                // like QEMU: device tree at the start of RAM, initrd after the kernel's
+                // full footprint (image_size covers .bss)
+                let image_size = u64::from_le_bytes(b.kernel[16..24].try_into().unwrap());
+                let end = kernel_addr + image_size.max(b.kernel.len() as u64);
+                let initrd = match &b.initrd {
+                    Some(data) => {
+                        let start = (end + 0x20_0000 + 0x1f_ffff) & !0x1f_ffff;
+                        if start + data.len() as u64 + 0x10_0000 > ram_end {
+                            return Err("initrd does not fit in RAM (try a larger -m)".into());
+                        }
+                        self.bus.load(start, data)?;
+                        Some((start, start + data.len() as u64))
+                    }
+                    None => None,
+                };
+                (base, initrd)
+            }
         };
         let dtb = self.device_tree(&b.cmdline, initrd);
         self.bus.load(dtb_addr, &dtb)?;
@@ -296,7 +384,11 @@ impl Machine {
                     }
                 }
             }
-            Arch::Aarch64 => return Err("aarch64 Linux boot is not implemented yet".into()),
+            Arch::Aarch64 => {
+                let cpu = self.cpu.as_any().downcast_mut::<Aarch64>().unwrap();
+                cpu.set_pc(kernel_addr);
+                cpu.set_reg(0, dtb_addr);
+            }
         }
         Ok(dtb)
     }

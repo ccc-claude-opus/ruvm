@@ -12,6 +12,10 @@ pub const OF: u8 = 4; // overflow
 pub const UF: u8 = 2; // underflow
 pub const NX: u8 = 1; // inexact
 
+/// Mode bit carried in the flags byte: detect tininess *before* rounding (ARM) instead of
+/// after (RISC-V). Callers mask it out of the result with `& 0x1f`.
+pub const TINY_BEFORE: u8 = 0x80;
+
 pub const RNE: u8 = 0;
 pub const RTZ: u8 = 1;
 pub const RDN: u8 = 2;
@@ -23,6 +27,7 @@ pub struct Fmt {
     exp: u32,
     frac: u32,
 }
+pub const F16: Fmt = Fmt { exp: 5, frac: 10 };
 pub const F32: Fmt = Fmt { exp: 8, frac: 23 };
 pub const F64: Fmt = Fmt { exp: 11, frac: 52 };
 
@@ -129,7 +134,7 @@ fn round_pack(f: Fmt, sign: bool, sig: u128, e: i32, rm: u8, fl: &mut u8) -> u64
     let inexact = rb || st;
     if big_e < emin && inexact {
         // tiny unless rounding to p bits with an unbounded exponent reaches 2^emin
-        let tiny = big_e < emin - 1 || {
+        let tiny = *fl & TINY_BEFORE != 0 || big_e < emin - 1 || {
             let (m2, rb2, st2) = shr_round(sig, top + 1 - p);
             m2 + (round_inc(rm, sign, m2, rb2, st2) as u128) < 1u128 << p
         };
@@ -314,6 +319,11 @@ pub fn sqrt(f: Fmt, a: u64, rm: u8, fl: &mut u8) -> u64 {
 
 /// a * b + c with a single rounding.
 pub fn fma(f: Fmt, a: u64, b: u64, c: u64, rm: u8, fl: &mut u8) -> u64 {
+    fma_scaled(f, a, b, c, 0, rm, fl)
+}
+
+/// (a * b + c) * 2^scale with a single rounding (FRSQRTS uses scale = -1).
+pub fn fma_scaled(f: Fmt, a: u64, b: u64, c: u64, scale: i32, rm: u8, fl: &mut u8) -> u64 {
     let ((sa, va), (sb, vb), (sc, vc)) = (unpack(f, a), unpack(f, b), unpack(f, c));
     let inf_zero = matches!((va, vb), (V::Inf, V::Zero) | (V::Zero, V::Inf));
     if va == V::SNaN || vb == V::SNaN || vc == V::SNaN || inf_zero {
@@ -334,11 +344,11 @@ pub fn fma(f: Fmt, a: u64, b: u64, c: u64, rm: u8, fl: &mut u8) -> u64 {
         }
         (_, _, V::Inf) => f.inf(sc),
         (V::Zero, _, V::Zero) | (_, V::Zero, V::Zero) => f.zero(if sp == sc { sp } else { rm == RDN }),
-        (V::Zero, _, _) | (_, V::Zero, _) => c,
-        (V::Num(ma, ea), V::Num(mb, eb), V::Zero) => round_pack(f, sp, ma * mb, ea + eb, rm, fl),
+        (V::Zero, _, V::Num(mc, ec)) | (_, V::Zero, V::Num(mc, ec)) => round_pack(f, sc, mc, ec + scale, rm, fl),
+        (V::Num(ma, ea), V::Num(mb, eb), V::Zero) => round_pack(f, sp, ma * mb, ea + eb + scale, rm, fl),
         (V::Num(ma, ea), V::Num(mb, eb), V::Num(mc, ec)) => {
             let (s, m, e) = add_exact(sp, ma * mb, ea + eb, sc, mc, ec);
-            if m == 0 { f.zero(rm == RDN) } else { round_pack(f, s, m, e, rm, fl) }
+            if m == 0 { f.zero(rm == RDN) } else { round_pack(f, s, m, e + scale, rm, fl) }
         }
         _ => unreachable!(),
     }
@@ -398,6 +408,48 @@ pub fn min_max(f: Fmt, a: u64, b: u64, max: bool, fl: &mut u8) -> u64 {
     }
 }
 
+pub fn is_snan(f: Fmt, x: u64) -> bool {
+    unpack(f, x).1 == V::SNaN
+}
+
+pub fn is_qnan(f: Fmt, x: u64) -> bool {
+    unpack(f, x).1 == V::QNaN
+}
+
+pub fn is_nan_bits(f: Fmt, x: u64) -> bool {
+    is_nan(unpack(f, x).1)
+}
+
+pub fn is_inf(f: Fmt, x: u64) -> bool {
+    unpack(f, x).1 == V::Inf
+}
+
+pub fn is_zero(f: Fmt, x: u64) -> bool {
+    unpack(f, x).1 == V::Zero
+}
+
+/// The quiet version of a NaN (sets the top fraction bit).
+pub fn quiet(f: Fmt, x: u64) -> u64 {
+    x | 1 << (f.frac - 1)
+}
+
+pub fn default_nan(f: Fmt) -> u64 {
+    f.canonical_nan()
+}
+
+pub fn neg(f: Fmt, x: u64) -> u64 {
+    x ^ f.sign_bit()
+}
+
+pub fn abs(f: Fmt, x: u64) -> u64 {
+    x & !f.sign_bit()
+}
+
+/// Total order of two non-NaN values (-0 == +0): Less / Equal / Greater.
+pub fn compare(f: Fmt, a: u64, b: u64) -> std::cmp::Ordering {
+    key(f, a, false).cmp(&key(f, b, false))
+}
+
 pub fn classify(f: Fmt, x: u64) -> u64 {
     let (s, v) = unpack(f, x);
     let subnormal = (x >> f.frac) & f.max_field() == 0;
@@ -418,7 +470,16 @@ pub fn classify(f: Fmt, x: u64) -> u64 {
 /// Float -> integer (`bits` = 32 or 64), saturating; the result is sign-extended
 /// to 64 bits (RISC-V puts 32-bit results sign-extended even when unsigned).
 pub fn to_int(f: Fmt, x: u64, rm: u8, signed: bool, bits: u32, fl: &mut u8) -> u64 {
+    to_int_scaled(f, x, rm, signed, bits, 0, fl)
+}
+
+/// Like `to_int` but converts `x * 2^scale` (fixed-point conversions).
+pub fn to_int_scaled(f: Fmt, x: u64, rm: u8, signed: bool, bits: u32, scale: i32, fl: &mut u8) -> u64 {
     let (s, v) = unpack(f, x);
+    let v = match v {
+        V::Num(m, e) => V::Num(m, e + scale),
+        v => v,
+    };
     let max: i128 = if signed { (1i128 << (bits - 1)) - 1 } else { (1i128 << bits) - 1 };
     let min: i128 = if signed { -(1i128 << (bits - 1)) } else { 0 };
     let ext = |r: i128| if bits == 32 { r as i32 as i64 as u64 } else { r as u64 };
@@ -454,13 +515,43 @@ pub fn to_int(f: Fmt, x: u64, rm: u8, signed: bool, bits: u32, fl: &mut u8) -> u
 
 /// Integer -> float. `v` is the source register; `bits` = 32 uses its low word.
 pub fn from_int(f: Fmt, v: u64, signed: bool, bits: u32, rm: u8, fl: &mut u8) -> u64 {
+    from_int_scaled(f, v, signed, bits, 0, rm, fl)
+}
+
+/// Integer -> float of `v * 2^scale` (fixed-point conversions use a negative scale).
+pub fn from_int_scaled(f: Fmt, v: u64, signed: bool, bits: u32, scale: i32, rm: u8, fl: &mut u8) -> u64 {
     let x: i128 = match (bits, signed) {
         (32, true) => v as i32 as i128,
         (32, false) => v as u32 as i128,
         (_, true) => v as i64 as i128,
         _ => v as i128,
     };
-    round_pack(f, x < 0, x.unsigned_abs(), 0, rm, fl)
+    round_pack(f, x < 0, x.unsigned_abs(), scale, rm, fl)
+}
+
+/// Round to an integral value in the same format (FRINT*). `exact` raises Inexact.
+pub fn round_to_int(f: Fmt, x: u64, rm: u8, exact: bool, fl: &mut u8) -> u64 {
+    let (s, v) = unpack(f, x);
+    match v {
+        V::Num(m, e) if e < 0 => {
+            let (q, rb, st) = shr_round(m, -e);
+            let q = q + round_inc(rm, s, q, rb, st) as u128;
+            if exact && (rb || st) {
+                *fl |= NX;
+            }
+            let mut dummy = 0;
+            if q == 0 { f.zero(s) } else { round_pack(f, s, q, 0, RNE, &mut dummy) }
+        }
+        _ => x, // zero, infinity, already integral (NaNs are handled by the caller)
+    }
+}
+
+/// Convert a NaN to another format keeping the sign and as much payload as fits (quieted).
+pub fn convert_nan(from: Fmt, to: Fmt, x: u64) -> u64 {
+    let sign = x & from.sign_bit() != 0;
+    let frac = x & from.frac_mask();
+    let frac = if to.frac >= from.frac { frac << (to.frac - from.frac) } else { frac >> (from.frac - to.frac) };
+    to.zero(sign) | to.max_field() << to.frac | frac | 1 << (to.frac - 1)
 }
 
 /// Convert between formats (fcvt.s.d / fcvt.d.s).

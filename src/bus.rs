@@ -2,6 +2,7 @@
 //! and a list of MMIO devices.
 
 use crate::devices::{Clint, Plic};
+use crate::gic::Gic;
 use std::fmt;
 
 #[derive(Debug, Clone, Copy)]
@@ -86,6 +87,9 @@ pub struct Bus {
     clint_base: Option<u64>,
     pub plic: Plic,
     plic_base: Option<u64>,
+    /// ARM GICv2 (distributor at `gic_base`, CPU interface at `gic_base + 0x10000`).
+    pub gic: Gic,
+    gic_base: Option<u64>,
     /// Set when a device asked to power off.
     pub halt: Option<i32>,
     /// Host stdin is connected: idle loops (WFI) should really sleep.
@@ -105,6 +109,8 @@ impl Bus {
             clint_base: None,
             plic: Plic::default(),
             plic_base: None,
+            gic: Gic::default(),
+            gic_base: None,
             halt: None,
             interactive: false,
         }
@@ -133,6 +139,10 @@ impl Bus {
 
     pub fn map_plic(&mut self, base: u64) {
         self.plic_base = Some(base);
+    }
+
+    pub fn map_gic(&mut self, base: u64) {
+        self.gic_base = Some(base);
     }
 
     /// Copy a blob into RAM (used by the image loader).
@@ -201,6 +211,10 @@ impl Bus {
             self.poll_irqs(); // a claim may have changed what is pending
             return Ok(v);
         }
+        if let Some(b) = self.gic_base.filter(|&b| addr >= b && addr < b + 0x2_0000) {
+            let v = self.gic.read(addr - b, size);
+            return Ok(v);
+        }
         let k = self.devs.iter().position(|m| addr >= m.base && addr < m.base + m.size).ok_or(BusError(addr))?;
         let m = &mut self.devs[k];
         let v = m.dev.read(addr - m.base, size);
@@ -220,6 +234,10 @@ impl Bus {
             self.poll_irqs();
             return Ok(());
         }
+        if let Some(b) = self.gic_base.filter(|&b| addr >= b && addr < b + 0x2_0000) {
+            self.gic.write(addr - b, size, val);
+            return Ok(());
+        }
         let k = self.devs.iter().position(|m| addr >= m.base && addr < m.base + m.size).ok_or(BusError(addr))?;
         let m = &mut self.devs[k];
         m.dev.write(addr - m.base, size, val);
@@ -235,13 +253,18 @@ impl Bus {
 
     /// Sample every device interrupt line into the PLIC.
     pub fn poll_irqs(&mut self) {
-        if self.plic_base.is_none() {
+        let (plic, gic) = (self.plic_base.is_some(), self.gic_base.is_some());
+        if !plic && !gic {
             return;
         }
         for m in &mut self.devs {
             if m.irq != 0 {
                 let level = m.dev.irq();
-                self.plic.set_level(m.irq, level);
+                if plic {
+                    self.plic.set_level(m.irq, level);
+                } else {
+                    self.gic.set_level(m.irq, level);
+                }
             }
         }
     }
