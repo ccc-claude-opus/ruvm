@@ -2,7 +2,7 @@ use ruvm::{demo, Arch, Machine, Stop};
 use std::process::exit;
 
 const USAGE: &str = "\
-ruvm 0.2 — a tiny QEMU-like emulator (RISC-V 64 / AArch64)
+ruvm 0.3 — a tiny QEMU-like emulator (RISC-V 64 / AArch64)
 
 USAGE:
     ruvm -M <riscv64|aarch64> (-kernel <file> | -demo hello) [options]
@@ -12,6 +12,9 @@ OPTIONS:
     -kernel, --kernel <file>      ELF64 or raw binary (raw is loaded at start of RAM)
     -demo <name>                  built-in demo program: hello
     -m <MiB>                      RAM size in MiB (default 128)
+    -drive file=<img>[,...]       raw disk image as virtio-mmio block device (writes go to the file)
+    -snapshot                     keep disk writes in memory (image file is not modified)
+    -input <text>                 type <text> on the guest console at start (\\n = newline)
     -icount <N>                   stop after N instructions
     -d, --trace                   trace every instruction (pc + raw word) to stderr
     -regs                         dump CPU registers on exit
@@ -21,6 +24,7 @@ OPTIONS:
 MEMORY MAP (as QEMU virt):
     riscv64   0x0010_0000 test finisher | 0x0200_0000 CLINT | 0x0c00_0000 PLIC
               0x1000_0000 NS16550 UART (PLIC irq 10)        | RAM 0x8000_0000
+              0x1000_1000 virtio-mmio block (PLIC irq 1, with -drive)
     aarch64   0x0900_0000 PL011 UART                        | RAM 0x4000_0000
 
 GUEST EXIT:
@@ -35,7 +39,8 @@ fn die(msg: &str) -> ! {
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let (mut arch, mut kernel, mut demo_name) = (None, None, None);
+    let (mut arch, mut kernel, mut demo_name, mut drive) = (None, None, None, None);
+    let (mut snapshot, mut input) = (false, String::new());
     let (mut ram, mut icount, mut trace, mut regs, mut interactive) = (128usize, None, false, false, false);
 
     while let Some(a) = args.next() {
@@ -47,10 +52,18 @@ fn main() {
             }
             "-kernel" | "--kernel" => kernel = Some(val("-kernel")),
             "-demo" | "--demo" => demo_name = Some(val("-demo")),
+            "-drive" | "-hda" | "--disk" => {
+                let v = val("-drive");
+                // accept QEMU syntax: file=fs.img,if=none,format=raw,...
+                let file = v.split(',').find_map(|kv| kv.strip_prefix("file=")).unwrap_or(&v).to_string();
+                drive = Some(file);
+            }
             "-m" => ram = val("-m").parse().unwrap_or_else(|_| die("-m expects a number of MiB")),
             "-icount" => icount = Some(val("-icount").parse().unwrap_or_else(|_| die("bad -icount"))),
             "-d" | "--trace" => trace = true,
             "-regs" => regs = true,
+            "-snapshot" => snapshot = true,
+            "-input" => input += &val("-input").replace("\\n", "\n"),
             "-serial" => interactive = val("-serial") == "stdio",
             "-h" | "--help" => {
                 print!("{USAGE}");
@@ -63,6 +76,12 @@ fn main() {
     let arch = arch.unwrap_or_else(|| die("missing -M <riscv64|aarch64>"));
     let mut vm = Machine::new(arch, ram, interactive);
     vm.trace = trace;
+    vm.send_input(input.as_bytes());
+    if let Some(path) = drive {
+        if let Err(e) = vm.attach_disk(&path, snapshot) {
+            die(&e);
+        }
+    }
 
     let loaded = match (kernel, demo_name) {
         (Some(path), _) => match std::fs::read(&path) {

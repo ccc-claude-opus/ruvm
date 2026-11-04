@@ -2,7 +2,9 @@
 
 use crate::bus::Bus;
 use crate::cpu::{aarch64::Aarch64, riscv::Riscv64, Cpu};
-use crate::devices::{TestFinisher, Uart, UartKind};
+use crate::devices::{forward_stdin, TestFinisher, Uart, UartKind};
+use std::sync::mpsc::{channel, Sender};
+use crate::virtio::VirtioBlk;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stop {
@@ -48,6 +50,7 @@ pub struct Machine {
     pub bus: Bus,
     pub trace: bool,
     pub insns: u64,
+    console_tx: Sender<u8>,
 }
 
 impl Machine {
@@ -58,22 +61,59 @@ impl Machine {
     pub fn new(arch: Arch, ram_mb: usize, interactive: bool) -> Machine {
         let mut bus = Bus::new(arch.ram_base(), ram_mb << 20);
         bus.interactive = interactive;
+        let (console_tx, console_rx) = channel();
+        if interactive {
+            forward_stdin(console_tx.clone());
+        }
+        let rx = Some(console_rx);
         let cpu: Box<dyn Cpu> = match arch {
             Arch::Riscv64 => {
                 bus.map(0x10_0000, 0x1000, Box::new(TestFinisher::default()));
                 bus.map_clint(0x200_0000);
                 bus.map_plic(0xc00_0000);
-                bus.map_irq(0x1000_0000, 0x100, 10, Box::new(Uart::new(UartKind::Ns16550, interactive)));
+                bus.map_irq(0x1000_0000, 0x100, 10, Box::new(Uart::new(UartKind::Ns16550, rx)));
                 Box::new(Riscv64::new())
             }
             Arch::Aarch64 => {
-                bus.map(0x0900_0000, 0x1000, Box::new(Uart::new(UartKind::Pl011, interactive)));
+                bus.map(0x0900_0000, 0x1000, Box::new(Uart::new(UartKind::Pl011, rx)));
                 Box::new(Aarch64::new())
             }
         };
-        let mut m = Machine { arch, cpu, bus, trace: false, insns: 0 };
+        let mut m = Machine { arch, cpu, bus, trace: false, insns: 0, console_tx };
         m.cpu.set_pc(arch.ram_base());
         m
+    }
+
+    /// Queue bytes for the guest console (as if typed on the serial line).
+    pub fn send_input(&self, bytes: &[u8]) {
+        for &b in bytes {
+            let _ = self.console_tx.send(b);
+        }
+    }
+
+    /// Attach a raw disk image as a virtio-mmio block device
+    /// (riscv64: 0x1000_1000, PLIC irq 1 — the first virtio slot of QEMU `virt`).
+    /// With `snapshot`, guest writes stay in memory instead of going to the file.
+    pub fn attach_disk(&mut self, path: &str, snapshot: bool) -> Result<(), String> {
+        let dev = if snapshot {
+            VirtioBlk::with_image(std::fs::read(path).map_err(|e| format!("{path}: {e}"))?, None)
+        } else {
+            VirtioBlk::open(path)?
+        };
+        self.attach_blk(dev)
+    }
+
+    /// Attach an in-memory disk image (writes are not persisted).
+    pub fn attach_disk_image(&mut self, image: Vec<u8>) -> Result<(), String> {
+        self.attach_blk(VirtioBlk::with_image(image, None))
+    }
+
+    fn attach_blk(&mut self, dev: VirtioBlk) -> Result<(), String> {
+        match self.arch {
+            Arch::Riscv64 => self.bus.map_irq(0x1000_1000, 0x1000, 1, Box::new(dev)),
+            Arch::Aarch64 => return Err("virtio disks are not wired up on aarch64 yet".into()),
+        }
+        Ok(())
     }
 
     /// Load a raw binary at `addr` and start executing there.
@@ -125,26 +165,24 @@ impl Machine {
 
     /// Run until the guest halts, faults, or `max_insns` instructions have executed.
     pub fn run(&mut self, max_insns: Option<u64>) -> Stop {
+        const BATCH: u64 = 4096;
         loop {
-            if max_insns.map_or(false, |m| self.insns >= m) {
+            let left = max_insns.map_or(BATCH, |m| m.saturating_sub(self.insns).min(BATCH));
+            if left == 0 {
                 return Stop::Limit;
             }
             if self.trace {
+                // trace mode: one instruction at a time (raw word read at the physical pc)
                 let pc = self.cpu.pc();
                 let raw = self.bus.read(pc, 4).unwrap_or(0);
                 eprintln!("[{:>10}] {:#018x}: {:08x}", self.insns, pc, raw);
             }
-            self.insns += 1;
-            self.bus.clint.mtime += 1;
-            if self.bus.interactive && self.insns & 0xfff == 0 {
-                self.bus.poll_irqs(); // pick up host keyboard input
-            }
-            if let Err(s) = self.cpu.step(&mut self.bus) {
+            let (ran, stop) = self.cpu.run(&mut self.bus, if self.trace { 1 } else { left });
+            self.insns += ran;
+            if let Some(s) = stop {
                 return s;
             }
-            if let Some(code) = self.bus.halt {
-                return Stop::Halt(code);
-            }
+            self.bus.poll_irqs(); // pick up console input
         }
     }
 }

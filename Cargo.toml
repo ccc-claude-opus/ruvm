@@ -1,6 +1,6 @@
 [package]
 name = "ruvm"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "A tiny QEMU-like machine emulator written in Rust (RISC-V 64 / AArch64)"
 license = "MIT"
@@ -12,6 +12,10 @@ path = "src/lib.rs"
 [[bin]]
 name = "ruvm"
 path = "src/main.rs"
+
+# Emulators are unusable unoptimised; keep debug assertions but optimise test builds.
+[profile.dev]
+opt-level = 2
 
 [profile.release]
 opt-level = 3

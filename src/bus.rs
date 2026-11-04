@@ -25,6 +25,48 @@ pub trait Device {
     fn irq(&mut self) -> bool {
         false
     }
+    /// Called after every register write: bus-mastering devices (virtio) access RAM here.
+    fn dma(&mut self, _mem: &mut Dma) {}
+}
+
+/// A device's view of guest RAM for DMA. Accesses outside RAM return `None`.
+pub struct Dma<'a> {
+    ram: &'a mut [u8],
+    base: u64,
+}
+
+impl Dma<'_> {
+    fn range(&self, addr: u64, len: usize) -> Option<std::ops::Range<usize>> {
+        let off = addr.checked_sub(self.base)?;
+        let end = off.checked_add(len as u64)?;
+        (end <= self.ram.len() as u64).then(|| off as usize..end as usize)
+    }
+    pub fn read(&self, addr: u64, len: usize) -> Option<&[u8]> {
+        Some(&self.ram[self.range(addr, len)?])
+    }
+    pub fn write(&mut self, addr: u64, data: &[u8]) -> Option<()> {
+        let r = self.range(addr, data.len())?;
+        self.ram[r].copy_from_slice(data);
+        Some(())
+    }
+    fn rn<const N: usize>(&self, addr: u64) -> Option<[u8; N]> {
+        self.read(addr, N)?.try_into().ok()
+    }
+    pub fn r16(&self, addr: u64) -> Option<u16> {
+        self.rn(addr).map(u16::from_le_bytes)
+    }
+    pub fn r32(&self, addr: u64) -> Option<u32> {
+        self.rn(addr).map(u32::from_le_bytes)
+    }
+    pub fn r64(&self, addr: u64) -> Option<u64> {
+        self.rn(addr).map(u64::from_le_bytes)
+    }
+    pub fn w16(&mut self, addr: u64, v: u16) -> Option<()> {
+        self.write(addr, &v.to_le_bytes())
+    }
+    pub fn w32(&mut self, addr: u64, v: u32) -> Option<()> {
+        self.write(addr, &v.to_le_bytes())
+    }
 }
 
 struct Mapping {
@@ -112,8 +154,15 @@ impl Bus {
         }
     }
 
+    /// Guest RAM as a byte slice (fast paths that already know an address is RAM).
     #[inline]
-    fn ram_off(&self, addr: u64, size: usize) -> Option<usize> {
+    pub fn ram(&self) -> &[u8] {
+        &self.ram
+    }
+
+    /// Offset into `ram()` of `size` bytes at physical `addr`, if they are all RAM.
+    #[inline]
+    pub fn ram_off(&self, addr: u64, size: usize) -> Option<usize> {
         let off = addr.wrapping_sub(self.ram_base);
         if off < self.ram.len() as u64 && off + size as u64 <= self.ram.len() as u64 {
             Some(off as usize)
@@ -174,6 +223,7 @@ impl Bus {
         let k = self.devs.iter().position(|m| addr >= m.base && addr < m.base + m.size).ok_or(BusError(addr))?;
         let m = &mut self.devs[k];
         m.dev.write(addr - m.base, size, val);
+        m.dev.dma(&mut Dma { ram: &mut self.ram, base: self.ram_base });
         if let Some(c) = m.dev.halt_code() {
             self.halt = Some(c);
         }
@@ -197,17 +247,20 @@ impl Bus {
     }
 
     /// Called when the CPU has nothing to do (WFI with no interrupt pending):
-    /// jump the clock to the next timer deadline instead of spinning.
-    pub fn idle(&mut self) {
+    /// jump the clock to the next timer deadline (CLINT `mtimecmp` or the CPU's own
+    /// `deadline`, e.g. Sstc `stimecmp`) instead of spinning. With a real console
+    /// attached, time advances in small real-time steps so typing is noticed.
+    pub fn idle(&mut self, deadline: u64) {
         let c = &mut self.clint;
+        let next = c.mtimecmp.min(deadline);
         if self.interactive {
             std::thread::sleep(std::time::Duration::from_micros(500));
             c.mtime += 5_000;
-            if c.mtimecmp > c.mtime && c.mtimecmp - c.mtime < 5_000 {
-                c.mtime = c.mtimecmp;
+            if next > c.mtime && next - c.mtime < 5_000 {
+                c.mtime = next;
             }
-        } else if c.mtimecmp != u64::MAX && c.mtimecmp > c.mtime {
-            c.mtime = c.mtimecmp;
+        } else if next != u64::MAX && next > c.mtime {
+            c.mtime = next;
         } else {
             c.mtime += 1_000;
         }

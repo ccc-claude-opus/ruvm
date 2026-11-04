@@ -153,3 +153,22 @@ fn riscv_compressed_hand_assembled() {
     m.load_raw(Arch::Riscv64.ram_base(), &img).unwrap();
     assert_eq!(m.run(Some(100)), Stop::Halt(10));
 }
+
+/// Boot MIT xv6-riscv (kernel + file system from tests/guest/build_xv6.sh) on the
+/// virtio disk, type two commands into the shell and check their output.
+#[test]
+fn xv6_boots_and_runs_shell_commands() {
+    let dir = format!("{}/tests/guest/prebuilt/xv6", env!("CARGO_MANIFEST_DIR"));
+    let out = Command::new(env!("CARGO_BIN_EXE_ruvm"))
+        .args(["-M", "riscv64", "-m", "128", "-kernel", &format!("{dir}/kernel")])
+        .args(["-drive", &format!("file={dir}/fs.img"), "-snapshot"])
+        .args(["-input", "echo hi from ruvm\\nmkdir d\\necho data > d/f\\ncat d/f | wc\\nls d\\n"])
+        .args(["-icount", "800000000"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(2), "expected to stop at the instruction limit:\n{text}");
+    for want in ["xv6 kernel is booting", "init: starting sh", "$ hi from ruvm", "1 1 5", "f              2 "] {
+        assert!(text.contains(want), "missing {want:?} in:\n{text}");
+    }
+}

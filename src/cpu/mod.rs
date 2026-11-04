@@ -14,6 +14,20 @@ pub trait Cpu {
     fn step(&mut self, bus: &mut Bus) -> Result<(), Stop>;
     /// Human-readable register dump.
     fn dump(&self) -> String;
+    /// Execute up to `n` instructions, advancing the board clock one tick per
+    /// instruction. Returns how many ran and why it stopped early, if it did.
+    fn run(&mut self, bus: &mut Bus, n: u64) -> (u64, Option<Stop>) {
+        for k in 0..n {
+            bus.clint.mtime += 1;
+            if let Err(s) = self.step(bus) {
+                return (k + 1, Some(s));
+            }
+            if let Some(code) = bus.halt {
+                return (k + 1, Some(Stop::Halt(code)));
+            }
+        }
+        (n, None)
+    }
 }
 
 /// Sign-extend the low `bits` bits of `v` to 64 bits.

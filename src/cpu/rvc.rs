@@ -30,6 +30,19 @@ fn jal(rd: u32, imm: i32) -> u32 {
     (m >> 20 & 1) << 31 | (m >> 1 & 0x3ff) << 21 | (m >> 11 & 1) << 20 | (m >> 12 & 0xff) << 12 | rd << 7 | 0x6f
 }
 
+/// Table-driven `expand`: all 2^16 encodings are expanded once (256 KiB);
+/// 0 marks an illegal encoding (0 is not a valid 32-bit instruction either).
+#[inline]
+pub fn expand_fast(c: u16) -> Option<u32> {
+    use std::sync::OnceLock;
+    static TABLE: OnceLock<Box<[u32]>> = OnceLock::new();
+    let t = TABLE.get_or_init(|| (0..=u16::MAX).map(|c| expand(c).unwrap_or(0)).collect());
+    match t[c as usize] {
+        0 => None,
+        i => Some(i),
+    }
+}
+
 pub fn expand(c: u16) -> Option<u32> {
     let c = c as u32;
     let f3 = c >> 13;

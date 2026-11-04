@@ -2,7 +2,7 @@
 
 use crate::bus::Device;
 use std::io::{Read, Write};
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::{Receiver, Sender};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum UartKind {
@@ -29,22 +29,8 @@ pub struct Uart {
 }
 
 impl Uart {
-    /// `interactive`: spawn a thread that feeds host stdin to the guest.
-    pub fn new(kind: UartKind, interactive: bool) -> Self {
-        let rx = if interactive {
-            let (tx, rx) = channel();
-            std::thread::spawn(move || {
-                let mut b = [0u8; 1];
-                while let Ok(1) = std::io::stdin().read(&mut b) {
-                    if tx.send(b[0]).is_err() {
-                        break;
-                    }
-                }
-            });
-            Some(rx)
-        } else {
-            None
-        };
+    /// `rx`: bytes the guest will receive (host stdin, scripted input, ...).
+    pub fn new(kind: UartKind, rx: Option<Receiver<u8>>) -> Self {
         Uart { kind, rx, pending: None, ier: 0, lcr: 0, mcr: 0, scr: 0, fcr: 0, dll: 0, dlm: 0, thre: false }
     }
 
@@ -66,6 +52,18 @@ impl Uart {
     fn dlab(&self) -> bool {
         self.lcr & 0x80 != 0
     }
+}
+
+/// Spawn a thread that forwards host stdin to `tx`.
+pub fn forward_stdin(tx: Sender<u8>) {
+    std::thread::spawn(move || {
+        let mut b = [0u8; 1];
+        while let Ok(1) = std::io::stdin().read(&mut b) {
+            if tx.send(b[0]).is_err() {
+                break;
+            }
+        }
+    });
 }
 
 impl Device for Uart {

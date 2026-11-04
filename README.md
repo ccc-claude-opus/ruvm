@@ -8,11 +8,21 @@ trap delegation, Sv39 paging, the C extension, CLINT timer/software interrupts a
 a PLIC; AArch64 EL0/EL1 exceptions, exclusives and LSE atomics. Both are checked
 instruction-for-instruction against `qemu-system-*` (see [doc/v0.2.md](doc/v0.2.md)).
 
+v0.3 boots **MIT xv6-riscv** to its shell from a virtio block device
+([doc/v0.3.md](doc/v0.3.md)). The goal is Linux on both architectures — see
+[doc/roadmap.md](doc/roadmap.md).
+
+```
+./target/release/ruvm -M riscv64 -kernel tests/guest/prebuilt/xv6/kernel \
+    -drive file=tests/guest/prebuilt/xv6/fs.img -snapshot -serial stdio
+```
+
 ```
 cargo build --release
 ./target/release/ruvm -M riscv64 -demo hello
 ./target/release/ruvm -M aarch64 -demo hello
 ./target/release/ruvm -M riscv64 -kernel prog.elf [-m 256] [-d] [-regs] [-icount N] [-serial stdio]
+./target/release/ruvm -M riscv64 -kernel kernel -drive file=disk.img [-snapshot] [-input "ls\n"]
 ```
 
 | | riscv64 | aarch64 |
@@ -20,6 +30,7 @@ cargo build --release
 | RAM | `0x8000_0000` | `0x4000_0000` |
 | UART | NS16550 @ `0x1000_0000` (PLIC irq 10) | PL011 @ `0x0900_0000` |
 | Interrupts | CLINT @ `0x0200_0000`, PLIC @ `0x0c00_0000` | — |
+| Disk | virtio-mmio block @ `0x1000_1000` (PLIC irq 1, with `-drive`) | — |
 | Power-off | write `0x5555` to `0x10_0000` (SiFive test finisher) | PSCI `SYSTEM_OFF` via `HVC`/`SMC` |
 | Host syscalls | `ecall`, a7=93 exit / 64 write (M-mode, while `mtvec==0`) | `svc #0`, x8=93 exit / 64 write (while `VBAR_EL1==0`) |
 
@@ -36,6 +47,7 @@ src/bus.rs        physical address space: RAM, CLINT, PLIC, MMIO devices + IRQ l
 src/devices.rs    UART (16550 / PL011), test finisher, CLINT, PLIC
 src/cpu/riscv.rs  RV64IMAC + Zicsr, M/S/U, Sv39 MMU + TLB, interrupts
 src/cpu/rvc.rs    compressed-instruction expander
+src/virtio.rs     virtio-mmio (v2) block device with DMA
 src/cpu/aarch64.rs  A64 integer subset, EL0/EL1 exceptions, exclusives, LSE
 src/host.rs       Linux-style exit/write "semihosting"
 src/machine.rs    board wiring, ELF/raw loader, run loop
@@ -58,6 +70,9 @@ add a memory map in `Machine::new`.
   `rv_priv` (M→S→U, delegation, Sv39, A/D, SUM/MXR/MPRV, timer/software/PLIC interrupts) and
   `a64_priv` (vectors, SVC/BRK/UDF/aborts from EL1 and EL0, ERET, SPSel, DAIF, LSE, CAS, LDXR/STXR).
 
+* xv6-riscv boots from the virtio disk and runs shell commands typed with `-input`
+  (`tests/guest/build_xv6.sh` rebuilds the pinned kernel and file system).
+
 `tests/guest/build.sh` rebuilds the user-level programs (Linux cross gcc, qemu-user);
 `tests/guest/build_sys.sh` rebuilds the system tests (`riscv64-unknown-elf-gcc`, clang/lld,
 qemu-system) and refreshes their reference output.
@@ -65,5 +80,5 @@ qemu-system) and refreshes their reference output.
 ## Not implemented (yet)
 
 Both: device tree, SIMD/FP, multi-core, block/net devices (virtio), JIT.
-RISC-V: F/D, PMP enforcement, Sv48/57, Sstc. AArch64: MMU, GIC + generic-timer interrupts,
+RISC-V: F/D, device tree/SBI (needed for Linux), PMP enforcement, Sv48/57. AArch64: MMU, GIC + generic-timer interrupts,
 EL2/EL3, FP/NEON.

@@ -4,7 +4,7 @@
 //! FENCE/FENCE.I/SFENCE.VMA, ECALL/EBREAK/MRET/SRET/WFI, trap delegation
 //! (medeleg/mideleg), vectored/direct trap vectors, MPRV/SUM/MXR/TVM/TW/TSR,
 //! Sv39 with hardware A/D update and a small TLB, CLINT timer/software and PLIC
-//! external interrupts.
+//! external interrupts, Sstc (`stimecmp`).
 //! Not supported: F/D, PMP (CSRs accepted but not enforced), Sv48/57, H extension.
 
 use super::{rvc, sext, Cpu};
@@ -28,6 +28,7 @@ const SEPC: usize = 0x141;
 const SCAUSE: usize = 0x142;
 const STVAL: usize = 0x143;
 const SIP: usize = 0x144;
+const STIMECMP: usize = 0x14d;
 const SATP: usize = 0x180;
 const MSTATUS: usize = 0x300;
 const MISA: usize = 0x301;
@@ -146,6 +147,11 @@ pub struct Riscv64 {
     time: u64,
     hw_ip: u64,
     tlb: Box<[TlbEntry; TLB_SIZE]>,
+    /// Fetch fast path: virtual page number + 1 of the current code page and the
+    /// RAM offset of its first byte (0 = invalid). Dropped on any change of
+    /// privilege, translation or mstatus.
+    fetch_vpn: u64,
+    fetch_off: usize,
 }
 
 #[inline]
@@ -159,6 +165,7 @@ impl Riscv64 {
         // RV64 (MXL=2), extensions A C I M S U
         csr[MISA] = (2u64 << 62) | 1 | (1 << 2) | (1 << 8) | (1 << 12) | (1 << 18) | (1 << 20);
         csr[MSTATUS] = MS_UXL_SXL;
+        csr[STIMECMP] = u64::MAX;
         Riscv64 {
             x: [0; 32],
             pc: 0,
@@ -169,6 +176,8 @@ impl Riscv64 {
             time: 0,
             hw_ip: 0,
             tlb: Box::new([TlbEntry::default(); TLB_SIZE]),
+            fetch_vpn: 0,
+            fetch_off: 0,
         }
     }
 
@@ -197,7 +206,7 @@ impl Riscv64 {
             SIE => self.csr[MIE] & self.csr[MIDELEG],
             SIP => self.mip() & self.csr[MIDELEG],
             MIP => self.mip(),
-            STVEC | SCOUNTEREN | SENVCFG | SSCRATCH | SEPC | SCAUSE | STVAL | SATP => self.csr[a],
+            STVEC | SCOUNTEREN | SENVCFG | SSCRATCH | SEPC | SCAUSE | STVAL | SATP | STIMECMP => self.csr[a],
             MSTATUS | MISA | MEDELEG | MIDELEG | MIE | MTVEC | MCOUNTEREN | MENVCFG | MCOUNTINHIBIT
             | MSCRATCH | MEPC | MCAUSE | MTVAL => self.csr[a],
             0x3a0..=0x3ef => self.csr[a], // pmpcfg / pmpaddr: stored, not enforced
@@ -210,6 +219,7 @@ impl Riscv64 {
     }
 
     fn csr_write(&mut self, a: usize, v: u64) {
+        self.fetch_vpn = 0;
         match a {
             SSTATUS => {
                 let m = SSTATUS_MASK & MSTATUS_W;
@@ -260,6 +270,10 @@ impl Riscv64 {
         if a == SATP && self.prv == PRV_S && self.csr[MSTATUS] & MS_TVM != 0 {
             return Err(illegal);
         }
+        // Sstc: S-mode may use stimecmp only when menvcfg.STCE and mcounteren.TM are set
+        if a == STIMECMP && self.prv == PRV_S && (self.csr[MENVCFG] >> 63 == 0 || self.csr[MCOUNTEREN] & 2 == 0) {
+            return Err(illegal);
+        }
         if (0xc00..=0xc1f).contains(&a) {
             let bit = 1 << (a - 0xc00);
             if (self.prv < PRV_M && self.csr[MCOUNTEREN] & bit == 0)
@@ -283,6 +297,7 @@ impl Riscv64 {
 
     /// Enter a trap. `cause` has bit 63 set for interrupts.
     fn take_trap(&mut self, cause: u64, tval: u64) -> Result<(), Stop> {
+        self.fetch_vpn = 0;
         let irq = cause & INTERRUPT != 0;
         let code = cause & !INTERRUPT;
         let deleg = if irq { self.csr[MIDELEG] } else { self.csr[MEDELEG] };
@@ -341,6 +356,7 @@ impl Riscv64 {
 
     fn flush_tlb(&mut self) {
         self.tlb.iter_mut().for_each(|e| e.vpn = 0);
+        self.fetch_vpn = 0;
     }
 
     /// Check a leaf PTE's permissions for `acc` at privilege `prv`.
@@ -452,10 +468,24 @@ impl Riscv64 {
     /// Fetch the instruction at pc; returns (32-bit instruction, length in bytes).
     fn fetch(&mut self, bus: &mut Bus) -> Result<(u32, u64), Ex> {
         let pc = self.pc;
+        let po = (pc & 0xfff) as usize;
+        if self.fetch_vpn == (pc >> 12) + 1 && po <= 0xffc {
+            let off = self.fetch_off + po;
+            let w = u32::from_le_bytes(bus.ram()[off..off + 4].try_into().unwrap());
+            if w & 3 != 3 {
+                let i = rvc::expand_fast(w as u16).ok_or(Ex::Trap(ILLEGAL, (w & 0xffff) as u64))?;
+                return Ok((i, 2));
+            }
+            return Ok((w, 4));
+        }
         let pa = self.translate(bus, pc, Access::Fetch)?;
+        if let Some(off) = bus.ram_off(pa & !0xfff, 0x1000) {
+            self.fetch_vpn = (pc >> 12) + 1;
+            self.fetch_off = off;
+        }
         let lo = bus.read(pa, 2).map_err(|_| Ex::Trap(INSN_ACCESS, pc))? as u32;
         if lo & 3 != 3 {
-            let i = rvc::expand(lo as u16).ok_or(Ex::Trap(ILLEGAL, lo as u64))?;
+            let i = rvc::expand_fast(lo as u16).ok_or(Ex::Trap(ILLEGAL, lo as u64))?;
             return Ok((i, 2));
         }
         let hi_va = pc.wrapping_add(2);
@@ -648,6 +678,7 @@ impl Riscv64 {
                         }
                         self.csr[MSTATUS] = ns;
                         self.prv = mpp;
+                        self.fetch_vpn = 0;
                         next = self.csr[MEPC];
                     }
                     (0x08, 2, 0) if rs1 == 0 => {
@@ -660,6 +691,7 @@ impl Riscv64 {
                         let sie = if ms & MS_SPIE != 0 { MS_SIE } else { 0 };
                         self.csr[MSTATUS] = (ms & !(MS_SIE | MS_SPP | MS_MPRV)) | sie | MS_SPIE;
                         self.prv = spp;
+                        self.fetch_vpn = 0;
                         next = self.csr[SEPC];
                     }
                     (0x08, 5, 0) if rs1 == 0 => {
@@ -668,7 +700,8 @@ impl Riscv64 {
                             return Err(illegal);
                         }
                         if self.mip() & self.csr[MIE] == 0 {
-                            bus.idle();
+                            let sstc = self.csr[MENVCFG] >> 63 == 1 && self.csr[MIE] & STI != 0;
+                            bus.idle(if sstc { self.csr[STIMECMP] } else { u64::MAX });
                         }
                     }
                     (0x09, _, 0) => {
@@ -768,6 +801,9 @@ impl Cpu for Riscv64 {
             | (bus.clint.msip as u64) << 3
             | (bus.plic.out[0] as u64) << 11
             | (bus.plic.out[1] as u64) << 9;
+        if self.csr[MENVCFG] >> 63 == 1 && self.time >= self.csr[STIMECMP] {
+            self.hw_ip |= STI; // Sstc
+        }
         if let Some(code) = self.pending_interrupt() {
             self.take_trap(INTERRUPT | code, 0)?;
         }
