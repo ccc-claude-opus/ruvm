@@ -8,6 +8,10 @@ trap delegation, Sv39 paging, the C extension, CLINT timer/software interrupts a
 a PLIC; AArch64 EL0/EL1 exceptions, exclusives and LSE atomics. Both are checked
 instruction-for-instruction against `qemu-system-*` (see [doc/v0.2.md](doc/v0.2.md)).
 
+v0.4 adds bit-exact F/D floating point, a device-tree generator, a built-in SBI and the
+Linux `Image` boot protocol (`-kernel/-initrd/-append`), and runs real OpenSBI firmware
+(`-bios`) ([doc/v0.4.md](doc/v0.4.md)).
+
 v0.3 boots **MIT xv6-riscv** to its shell from a virtio block device
 ([doc/v0.3.md](doc/v0.3.md)). The goal is Linux on both architectures — see
 [doc/roadmap.md](doc/roadmap.md).
@@ -45,7 +49,9 @@ Images: ELF64 (little-endian, `PT_LOAD` segments, entry = start PC) or raw binar
 ```
 src/bus.rs        physical address space: RAM, CLINT, PLIC, MMIO devices + IRQ lines
 src/devices.rs    UART (16550 / PL011), test finisher, CLINT, PLIC
-src/cpu/riscv.rs  RV64IMAC + Zicsr, M/S/U, Sv39 MMU + TLB, interrupts
+src/cpu/riscv.rs  RV64IMAFDC + Zicsr, M/S/U, Sv39 MMU + TLB, interrupts, built-in SBI
+src/cpu/softfloat.rs  bit-exact IEEE 754 binary32/64 (all rounding modes, flags)
+src/fdt.rs        device-tree blob writer
 src/cpu/rvc.rs    compressed-instruction expander
 src/virtio.rs     virtio-mmio (v2) block device with DMA
 src/cpu/aarch64.rs  A64 integer subset, EL0/EL1 exceptions, exclusives, LSE
@@ -70,6 +76,10 @@ add a memory map in `Machine::new`.
   `rv_priv` (M→S→U, delegation, Sv39, A/D, SUM/MXR/MPRV, timer/software/PLIC interrupts) and
   `a64_priv` (vectors, SVC/BRK/UDF/aborts from EL1 and EL0, ERET, SPSel, DAIF, LSE, CAS, LDXR/STXR).
 
+* `rv_fp`: every F/D instruction over special operands in all rounding modes, hashed
+  results + flags equal to qemu-system-riscv64;
+* `rv_sbi`: an S-mode payload printing through SBI gives the same output with ruvm's
+  built-in SBI, with OpenSBI running on ruvm, and with OpenSBI on QEMU;
 * xv6-riscv boots from the virtio disk and runs shell commands typed with `-input`
   (`tests/guest/build_xv6.sh` rebuilds the pinned kernel and file system).
 
@@ -80,5 +90,5 @@ qemu-system) and refreshes their reference output.
 ## Not implemented (yet)
 
 Both: device tree, SIMD/FP, multi-core, block/net devices (virtio), JIT.
-RISC-V: F/D, device tree/SBI (needed for Linux), PMP enforcement, Sv48/57. AArch64: MMU, GIC + generic-timer interrupts,
+RISC-V: PMP enforcement, Sv48/57, V (vector). AArch64: MMU, GIC + generic-timer interrupts,
 EL2/EL3, FP/NEON.

@@ -1,12 +1,14 @@
-//! RV64IMAC + Zicsr/Zifencei with M/S/U privilege modes, Sv39 paging and interrupts.
+//! RV64IMAFDC + Zicsr/Zifencei with M/S/U privilege modes, Sv39 paging and interrupts.
 //!
-//! Supported: RV64I, M, A (LR/SC + AMOs, single hart), C (via `rvc::expand`), Zicsr,
+//! Supported: RV64I, M, A (LR/SC + AMOs, single hart), F/D (bit-exact, see
+//! `softfloat`), C (via `rvc::expand`), Zicsr,
 //! FENCE/FENCE.I/SFENCE.VMA, ECALL/EBREAK/MRET/SRET/WFI, trap delegation
 //! (medeleg/mideleg), vectored/direct trap vectors, MPRV/SUM/MXR/TVM/TW/TSR,
 //! Sv39 with hardware A/D update and a small TLB, CLINT timer/software and PLIC
 //! external interrupts, Sstc (`stimecmp`).
-//! Not supported: F/D, PMP (CSRs accepted but not enforced), Sv48/57, H extension.
+//! Not supported: PMP (CSRs accepted but not enforced), Sv48/57, H extension.
 
+use super::softfloat::{self as sf, Fmt, F32, F64};
 use super::{rvc, sext, Cpu};
 use crate::bus::Bus;
 use crate::host::{self, Host};
@@ -52,6 +54,8 @@ const MS_SPIE: u64 = 1 << 5;
 const MS_MPIE: u64 = 1 << 7;
 const MS_SPP: u64 = 1 << 8;
 const MS_MPP: u64 = 3 << 11;
+const MS_FS: u64 = 3 << 13;
+const MS_SD: u64 = 1 << 63;
 const MS_MPRV: u64 = 1 << 17;
 const MS_SUM: u64 = 1 << 18;
 const MS_MXR: u64 = 1 << 19;
@@ -59,9 +63,20 @@ const MS_TVM: u64 = 1 << 20;
 const MS_TW: u64 = 1 << 21;
 const MS_TSR: u64 = 1 << 22;
 const MS_UXL_SXL: u64 = 0xa << 32; // both 64-bit
-const MSTATUS_W: u64 =
-    MS_SIE | MS_MIE | MS_SPIE | MS_MPIE | MS_SPP | MS_MPP | MS_MPRV | MS_SUM | MS_MXR | MS_TVM | MS_TW | MS_TSR;
-const SSTATUS_MASK: u64 = MS_SIE | MS_SPIE | MS_SPP | MS_SUM | MS_MXR | (3 << 32);
+const MSTATUS_W: u64 = MS_SIE
+    | MS_MIE
+    | MS_SPIE
+    | MS_MPIE
+    | MS_SPP
+    | MS_MPP
+    | MS_FS
+    | MS_MPRV
+    | MS_SUM
+    | MS_MXR
+    | MS_TVM
+    | MS_TW
+    | MS_TSR;
+const SSTATUS_MASK: u64 = MS_SIE | MS_SPIE | MS_SPP | MS_FS | MS_SUM | MS_MXR | (3 << 32) | MS_SD;
 
 // interrupt bits (mip / mie)
 const SSI: u64 = 1 << 1;
@@ -138,6 +153,10 @@ struct TlbEntry {
 
 pub struct Riscv64 {
     x: [u64; 32],
+    /// FP registers; single-precision values are NaN-boxed (upper 32 bits all ones).
+    f: [u64; 32],
+    fflags: u8,
+    frm: u8,
     pc: u64,
     prv: u64,
     csr: Vec<u64>,
@@ -152,6 +171,9 @@ pub struct Riscv64 {
     /// privilege, translation or mstatus.
     fetch_vpn: u64,
     fetch_off: usize,
+    /// Built-in SBI firmware: `ecall` from S-mode is served by the emulator
+    /// (set by `boot_supervisor`; with `-bios <file>` the real firmware does it).
+    sbi: bool,
 }
 
 #[inline]
@@ -162,12 +184,15 @@ fn sx32(v: u32) -> u64 {
 impl Riscv64 {
     pub fn new() -> Self {
         let mut csr = vec![0u64; 4096];
-        // RV64 (MXL=2), extensions A C I M S U
-        csr[MISA] = (2u64 << 62) | 1 | (1 << 2) | (1 << 8) | (1 << 12) | (1 << 18) | (1 << 20);
+        // RV64 (MXL=2), extensions A C D F I M S U
+        csr[MISA] = (2u64 << 62) | 1 | (1 << 2) | (1 << 3) | (1 << 5) | (1 << 8) | (1 << 12) | (1 << 18) | (1 << 20);
         csr[MSTATUS] = MS_UXL_SXL;
         csr[STIMECMP] = u64::MAX;
         Riscv64 {
             x: [0; 32],
+            f: [0; 32],
+            fflags: 0,
+            frm: 0,
             pc: 0,
             prv: PRV_M,
             csr,
@@ -178,6 +203,7 @@ impl Riscv64 {
             tlb: Box::new([TlbEntry::default(); TLB_SIZE]),
             fetch_vpn: 0,
             fetch_off: 0,
+            sbi: false,
         }
     }
 
@@ -186,11 +212,116 @@ impl Riscv64 {
         self.prv
     }
 
+    pub fn set_reg(&mut self, r: usize, v: u64) {
+        self.set(r, v);
+    }
+
+    /// Start like a kernel entered from SBI firmware: S-mode at `entry` with
+    /// a0 = hart id, a1 = device-tree address; the emulator itself answers SBI calls.
+    pub fn boot_supervisor(&mut self, entry: u64, dtb: u64) {
+        self.sbi = true;
+        self.prv = PRV_S;
+        self.pc = entry;
+        self.x[10] = 0;
+        self.x[11] = dtb;
+        // what OpenSBI would leave behind: delegate everything S-mode can handle
+        self.csr[MEDELEG] = 0xb1ff | 1 << 12 | 1 << 13 | 1 << 15;
+        self.csr[MIDELEG] = S_INTS;
+        self.csr[MCOUNTEREN] = 0xffff_ffff;
+        self.csr[MENVCFG] = 1 << 63 | 1 << 61; // STCE (Sstc), ADUE (hardware A/D)
+    }
+
+    /// SBI v2.0 subset: BASE, TIME, IPI, RFENCE, HSM, SRST, DBCN and the legacy calls.
+    fn sbi_call(&mut self, bus: &mut Bus) -> Result<(), Stop> {
+        const NOT_SUPPORTED: u64 = -2i64 as u64;
+        const INVALID_PARAM: u64 = -3i64 as u64;
+        const ALREADY_AVAILABLE: u64 = -6i64 as u64;
+        const EXTS: [u64; 7] = [0x10, 0x5449_4d45, 0x73_5049, 0x5246_4e43, 0x48_534d, 0x5352_5354, 0x4442_434e];
+        let (eid, fid) = (self.x[17], self.x[16]);
+        let a = [self.x[10], self.x[11], self.x[12]];
+        // console output, with "\n" -> "\r\n" like OpenSBI
+        let put = |bytes: &[u8]| {
+            use std::io::Write;
+            let mut out = std::io::stdout().lock();
+            for &b in bytes {
+                let _ = if b == b'\n' { out.write_all(b"\r\n") } else { out.write_all(&[b]) };
+            }
+            let _ = out.flush();
+        };
+        let (err, val) = match eid {
+            0x00 | 0x5449_4d45 => {
+                self.csr[STIMECMP] = a[0]; // set_timer (Sstc compare register)
+                (0, 0)
+            }
+            0x01 => {
+                put(&[a[0] as u8]);
+                (0, 0)
+            }
+            0x02 => (-1i64 as u64, 0), // console_getchar: nothing
+            0x08 => return Err(Stop::Halt(0)),
+            0x10 => match fid {
+                0 => (0, 2 << 24),          // spec version 2.0
+                1 => (0, 0x7275_766d),      // implementation id ("ruvm")
+                2 => (0, 0x0004_0000),      // implementation version
+                3 => (0, (EXTS.contains(&a[0]) || a[0] <= 8) as u64),
+                _ => (0, 0),                // mvendorid / marchid / mimpid
+            },
+            0x73_5049 => {
+                if a[1] == u64::MAX || (a[1] == 0 && a[0] & 1 == 1) {
+                    self.csr[MIP] |= SSI;
+                }
+                (0, 0)
+            }
+            0x5246_4e43 => {
+                self.flush_tlb();
+                (0, 0)
+            }
+            0x48_534d => match fid {
+                0 => (if a[0] == 0 { ALREADY_AVAILABLE } else { INVALID_PARAM }, 0), // hart_start
+                2 => if a[0] == 0 { (0, 0) } else { (INVALID_PARAM, 0) },             // hart_get_status: started
+                _ => (NOT_SUPPORTED, 0),
+            },
+            0x5352_5354 if fid == 0 => return Err(Stop::Halt((a[1] != 0) as i32)), // system_reset
+            0x4442_434e => match fid {
+                0 => {
+                    let base = a[1] | a[2] << 32;
+                    let bytes: Vec<u8> = (0..a[0]).map(|k| bus.read(base + k, 1).unwrap_or(0) as u8).collect();
+                    put(&bytes);
+                    (0, a[0])
+                }
+                1 => (0, 0),
+                2 => {
+                    put(&[a[0] as u8]);
+                    (0, 0)
+                }
+                _ => (NOT_SUPPORTED, 0),
+            },
+            _ => (NOT_SUPPORTED, 0),
+        };
+        if eid < 0x10 {
+            self.x[10] = err | val; // legacy calls return a single value
+        } else {
+            self.x[10] = err;
+            self.x[11] = val;
+        }
+        Ok(())
+    }
+
     #[inline]
     fn set(&mut self, rd: usize, v: u64) {
         if rd != 0 {
             self.x[rd] = v;
         }
+    }
+
+    /// mstatus with the read-only SD summary bit.
+    fn mstatus(&self) -> u64 {
+        let ms = self.csr[MSTATUS];
+        if ms & MS_FS == MS_FS { ms | MS_SD } else { ms }
+    }
+
+    fn fp_dirty(&mut self) {
+        self.csr[MSTATUS] |= MS_FS;
     }
 
     fn mip(&self) -> u64 {
@@ -202,12 +333,17 @@ impl Riscv64 {
     /// `None` = no such CSR (illegal instruction).
     fn csr_read(&self, a: usize) -> Option<u64> {
         Some(match a {
-            SSTATUS => self.csr[MSTATUS] & SSTATUS_MASK,
+            0x001..=0x003 if self.csr[MSTATUS] & MS_FS == 0 => return None,
+            0x001 => self.fflags as u64,
+            0x002 => self.frm as u64,
+            0x003 => (self.frm as u64) << 5 | self.fflags as u64,
+            SSTATUS => self.mstatus() & SSTATUS_MASK,
+            MSTATUS => self.mstatus(),
             SIE => self.csr[MIE] & self.csr[MIDELEG],
             SIP => self.mip() & self.csr[MIDELEG],
             MIP => self.mip(),
             STVEC | SCOUNTEREN | SENVCFG | SSCRATCH | SEPC | SCAUSE | STVAL | SATP | STIMECMP => self.csr[a],
-            MSTATUS | MISA | MEDELEG | MIDELEG | MIE | MTVEC | MCOUNTEREN | MENVCFG | MCOUNTINHIBIT
+            MISA | MEDELEG | MIDELEG | MIE | MTVEC | MCOUNTEREN | MENVCFG | MCOUNTINHIBIT
             | MSCRATCH | MEPC | MCAUSE | MTVAL => self.csr[a],
             0x3a0..=0x3ef => self.csr[a], // pmpcfg / pmpaddr: stored, not enforced
             0xb00 | 0xb02 | 0xc00 | 0xc02 => self.insns, // mcycle minstret cycle instret
@@ -221,6 +357,19 @@ impl Riscv64 {
     fn csr_write(&mut self, a: usize, v: u64) {
         self.fetch_vpn = 0;
         match a {
+            0x001 => {
+                self.fflags = v as u8 & 0x1f;
+                self.fp_dirty();
+            }
+            0x002 => {
+                self.frm = v as u8 & 7;
+                self.fp_dirty();
+            }
+            0x003 => {
+                self.fflags = v as u8 & 0x1f;
+                self.frm = (v >> 5) as u8 & 7;
+                self.fp_dirty();
+            }
             SSTATUS => {
                 let m = SSTATUS_MASK & MSTATUS_W;
                 self.csr[MSTATUS] = (self.csr[MSTATUS] & !m) | (v & m);
@@ -648,6 +797,7 @@ impl Riscv64 {
                 self.set(rd, v);
             }
             0x0f => {} // FENCE / FENCE.I: nothing to do on a single hart without caches
+            0x07 | 0x27 | 0x43 | 0x47 | 0x4b | 0x4f | 0x53 => self.fp(bus, i, op, rd, rs1, rs2, f3)?,
             0x2f => self.amo(bus, i, rd, f3, a, b)?,
             0x73 if f3 == 0 => {
                 match (f7, rs2, rd) {
@@ -722,6 +872,140 @@ impl Riscv64 {
         Ok(())
     }
 
+    // ------------------------------------------------------------------ F / D
+
+    /// Read FP register `r` as format `fmt` (an improperly NaN-boxed single reads as NaN).
+    fn fget(&self, fmt: Fmt, r: usize) -> u64 {
+        let v = self.f[r];
+        if fmt.sign_bit() == F64.sign_bit() {
+            v
+        } else if v >> 32 == 0xffff_ffff {
+            v & 0xffff_ffff
+        } else {
+            F32.canonical_nan()
+        }
+    }
+
+    fn fset(&mut self, fmt: Fmt, r: usize, v: u64) {
+        self.f[r] = if fmt.sign_bit() == F64.sign_bit() { v } else { v | 0xffff_ffff_0000_0000 };
+        self.fp_dirty();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fp(&mut self, bus: &mut Bus, i: u32, op: u32, rd: usize, rs1: usize, rs2: usize, f3: u32) -> Result<(), Ex> {
+        let illegal = Ex::Trap(ILLEGAL, i as u64);
+        if self.csr[MSTATUS] & MS_FS == 0 {
+            return Err(illegal);
+        }
+        // loads / stores
+        if op == 0x07 || op == 0x27 {
+            let s = i as i32 as i64;
+            let imm = if op == 0x07 { (s >> 20) as u64 } else { (((s >> 25) << 5) | ((i >> 7) & 0x1f) as i64) as u64 };
+            let addr = self.x[rs1].wrapping_add(imm);
+            match (op, f3) {
+                (0x07, 2) => {
+                    let v = self.load(bus, addr, 4)?;
+                    self.fset(F32, rd, v);
+                }
+                (0x07, 3) => {
+                    let v = self.load(bus, addr, 8)?;
+                    self.fset(F64, rd, v);
+                }
+                (0x27, 2) => self.store(bus, addr, 4, self.f[rs2])?,
+                (0x27, 3) => self.store(bus, addr, 8, self.f[rs2])?,
+                _ => return Err(illegal),
+            }
+            return Ok(());
+        }
+        let fmt = match (i >> 25) & 3 {
+            0 => F32,
+            1 => F64,
+            _ => return Err(illegal),
+        };
+        let rm = if f3 == 7 { self.frm as u32 } else { f3 };
+        let rm_ok = rm <= 4;
+        let rm = rm as u8;
+        let mut fl = 0u8;
+        let (a, b) = (self.fget(fmt, rs1), self.fget(fmt, rs2));
+        if op != 0x53 {
+            // FMADD / FMSUB / FNMSUB / FNMADD
+            if !rm_ok {
+                return Err(illegal);
+            }
+            let c = self.fget(fmt, (i >> 27) as usize);
+            let neg_prod = op == 0x4b || op == 0x4f;
+            let neg_c = op == 0x47 || op == 0x4f;
+            let a = if neg_prod { a ^ fmt.sign_bit() } else { a };
+            let c = if neg_c { c ^ fmt.sign_bit() } else { c };
+            let r = sf::fma(fmt, a, b, c, rm, &mut fl);
+            self.fset(fmt, rd, r);
+        } else {
+            let needs_rm = matches!(i >> 27, 0x00 | 0x01 | 0x02 | 0x03 | 0x0b | 0x08 | 0x18 | 0x1a);
+            if needs_rm && !rm_ok {
+                return Err(illegal);
+            }
+            match (i >> 27, f3, rs2) {
+                (0x00, _, _) => self.fset(fmt, rd, sf::add(fmt, a, b, rm, &mut fl)),
+                (0x01, _, _) => self.fset(fmt, rd, sf::sub(fmt, a, b, rm, &mut fl)),
+                (0x02, _, _) => self.fset(fmt, rd, sf::mul(fmt, a, b, rm, &mut fl)),
+                (0x03, _, _) => self.fset(fmt, rd, sf::div(fmt, a, b, rm, &mut fl)),
+                (0x0b, _, 0) => self.fset(fmt, rd, sf::sqrt(fmt, a, rm, &mut fl)),
+                (0x04, 0..=2, _) => {
+                    let sb = fmt.sign_bit();
+                    let sign = match f3 {
+                        0 => b & sb,
+                        1 => !b & sb,
+                        _ => (a ^ b) & sb,
+                    };
+                    self.fset(fmt, rd, (a & !sb) | sign);
+                }
+                (0x05, 0 | 1, _) => self.fset(fmt, rd, sf::min_max(fmt, a, b, f3 == 1, &mut fl)),
+                (0x08, _, 1) if fmt.sign_bit() == F32.sign_bit() => {
+                    let v = sf::convert(F64, F32, self.fget(F64, rs1), rm, &mut fl); // fcvt.s.d
+                    self.fset(F32, rd, v);
+                }
+                (0x08, _, 0) if fmt.sign_bit() == F64.sign_bit() => {
+                    let v = sf::convert(F32, F64, self.fget(F32, rs1), rm, &mut fl); // fcvt.d.s
+                    self.fset(F64, rd, v);
+                }
+                (0x14, 0..=2, _) => {
+                    let r = match f3 {
+                        2 => sf::eq(fmt, a, b, &mut fl),
+                        1 => sf::lt(fmt, a, b, &mut fl),
+                        _ => sf::le(fmt, a, b, &mut fl),
+                    };
+                    self.set(rd, r as u64);
+                }
+                (0x18, _, 0..=3) => {
+                    let bits = if rs2 < 2 { 32 } else { 64 };
+                    let v = sf::to_int(fmt, a, rm, rs2 & 1 == 0, bits, &mut fl);
+                    self.set(rd, v);
+                }
+                (0x1a, _, 0..=3) => {
+                    let bits = if rs2 < 2 { 32 } else { 64 };
+                    let v = sf::from_int(fmt, self.x[rs1], rs2 & 1 == 0, bits, rm, &mut fl);
+                    self.fset(fmt, rd, v);
+                }
+                (0x1c, 0, 0) => {
+                    // fmv.x.w / fmv.x.d: raw bits
+                    let v = self.f[rs1];
+                    self.set(rd, if fmt.sign_bit() == F32.sign_bit() { v as i32 as i64 as u64 } else { v });
+                }
+                (0x1c, 1, 0) => self.set(rd, sf::classify(fmt, a)),
+                (0x1e, 0, 0) => {
+                    let v = self.x[rs1];
+                    self.fset(fmt, rd, if fmt.sign_bit() == F32.sign_bit() { v & 0xffff_ffff } else { v });
+                }
+                _ => return Err(illegal),
+            }
+        }
+        if fl != 0 {
+            self.fflags |= fl;
+            self.fp_dirty();
+        }
+        Ok(())
+    }
+
     /// LR / SC / AMO*.{W,D}
     fn amo(&mut self, bus: &mut Bus, i: u32, rd: usize, f3: u32, addr: u64, b: u64) -> Result<(), Ex> {
         let w = match f3 {
@@ -784,6 +1068,9 @@ impl Default for Riscv64 {
 }
 
 impl Cpu for Riscv64 {
+    fn as_any(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
     fn name(&self) -> &'static str {
         "riscv64"
     }
@@ -810,6 +1097,11 @@ impl Cpu for Riscv64 {
         match self.exec(bus) {
             Ok(()) => Ok(()),
             Err(Ex::Stop(s)) => Err(s),
+            Err(Ex::Trap(cause, _)) if self.sbi && cause == ECALL_U + PRV_S => {
+                self.sbi_call(bus)?;
+                self.pc += 4;
+                Ok(())
+            }
             Err(Ex::Trap(cause, tval)) => self.take_trap(cause, tval),
         }
     }

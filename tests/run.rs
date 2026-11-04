@@ -172,3 +172,36 @@ fn xv6_boots_and_runs_shell_commands() {
         assert!(text.contains(want), "missing {want:?} in:\n{text}");
     }
 }
+
+/// Every F/D instruction over special operands in all rounding modes: result bits and
+/// fflags must hash-match qemu-system-riscv64.
+#[test]
+fn riscv_fp_matches_qemu_system() {
+    let out = String::from_utf8(run_elf("riscv64", "rv_fp.elf")).unwrap();
+    assert_eq!(out, expected("rv_fp.expected"));
+}
+
+fn sbi_payload(extra: &[&str]) -> String {
+    let dir = format!("{}/tests/guest/prebuilt", env!("CARGO_MANIFEST_DIR"));
+    let out = Command::new(env!("CARGO_BIN_EXE_ruvm"))
+        .args(["-M", "riscv64", "-kernel", &format!("{dir}/rv_sbi.Image"), "-icount", "200000000"])
+        .args(extra.iter().map(|a| a.replace("@DIR@", &dir)))
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    text[text.find("S-mode payload").expect("payload did not run")..].to_string()
+}
+
+/// An S-mode payload (Linux Image format) using SBI: ruvm's built-in SBI must behave
+/// like OpenSBI on QEMU.
+#[test]
+fn builtin_sbi_matches_opensbi_on_qemu() {
+    assert_eq!(sbi_payload(&[]), expected("rv_sbi.expected"));
+}
+
+/// Real OpenSBI firmware (QEMU's fw_dynamic) running on ruvm in M-mode.
+#[test]
+fn opensbi_firmware_boots_payload() {
+    assert_eq!(sbi_payload(&["-bios", "@DIR@/opensbi-fw_dynamic.bin"]), expected("rv_sbi.expected"));
+}

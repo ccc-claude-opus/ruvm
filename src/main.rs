@@ -1,15 +1,20 @@
-use ruvm::{demo, Arch, Machine, Stop};
+use ruvm::{demo, is_linux_image, Arch, LinuxBoot, Machine, Stop};
 use std::process::exit;
 
 const USAGE: &str = "\
-ruvm 0.3 — a tiny QEMU-like emulator (RISC-V 64 / AArch64)
+ruvm 0.4 — a tiny QEMU-like emulator (RISC-V 64 / AArch64)
 
 USAGE:
     ruvm -M <riscv64|aarch64> (-kernel <file> | -demo hello) [options]
 
 OPTIONS:
     -M, -machine, --arch <arch>   riscv64 | aarch64   (aliases: rv64, arm64, arm)
-    -kernel, --kernel <file>      ELF64 or raw binary (raw is loaded at start of RAM)
+    -kernel, --kernel <file>      Linux Image, ELF64 or raw binary (raw is loaded at start of RAM)
+    -initrd <file>                initial ramdisk for a Linux Image
+    -append <cmdline>             Linux kernel command line
+    -bios <file|none>             firmware run before a Linux Image (e.g. OpenSBI fw_dynamic.bin);
+                                  default: ruvm's built-in SBI starts the kernel in S-mode
+    -dumpdtb <file>               write the generated device tree and exit
     -demo <name>                  built-in demo program: hello
     -m <MiB>                      RAM size in MiB (default 128)
     -drive file=<img>[,...]       raw disk image as virtio-mmio block device (writes go to the file)
@@ -41,6 +46,7 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let (mut arch, mut kernel, mut demo_name, mut drive) = (None, None, None, None);
     let (mut snapshot, mut input) = (false, String::new());
+    let (mut initrd, mut append, mut bios, mut dumpdtb) = (None, String::new(), None, None);
     let (mut ram, mut icount, mut trace, mut regs, mut interactive) = (128usize, None, false, false, false);
 
     while let Some(a) = args.next() {
@@ -63,6 +69,10 @@ fn main() {
             "-d" | "--trace" => trace = true,
             "-regs" => regs = true,
             "-snapshot" => snapshot = true,
+            "-initrd" => initrd = Some(val("-initrd")),
+            "-append" => append = val("-append"),
+            "-bios" => bios = Some(val("-bios")).filter(|b| b != "none"),
+            "-dumpdtb" => dumpdtb = Some(val("-dumpdtb")),
             "-input" => input += &val("-input").replace("\\n", "\n"),
             "-serial" => interactive = val("-serial") == "stdio",
             "-h" | "--help" => {
@@ -84,10 +94,30 @@ fn main() {
     }
 
     let loaded = match (kernel, demo_name) {
-        (Some(path), _) => match std::fs::read(&path) {
-            Ok(data) => vm.load_image(&data),
-            Err(e) => die(&format!("cannot read {path}: {e}")),
-        },
+        (Some(path), _) => {
+            let read = |p: &str| std::fs::read(p).unwrap_or_else(|e| die(&format!("cannot read {p}: {e}")));
+            let data = read(&path);
+            if is_linux_image(arch, &data) {
+                let boot = LinuxBoot {
+                    kernel: data,
+                    initrd: initrd.as_deref().map(read),
+                    cmdline: append.clone(),
+                    bios: bios.as_deref().map(read),
+                };
+                match vm.boot_linux(&boot) {
+                    Ok(dtb) => {
+                        if let Some(f) = &dumpdtb {
+                            std::fs::write(f, &dtb).unwrap_or_else(|e| die(&format!("{f}: {e}")));
+                            return;
+                        }
+                        Ok(())
+                    }
+                    Err(e) => Err(e),
+                }
+            } else {
+                vm.load_image(&data)
+            }
+        }
         (None, Some(name)) if name == "hello" => {
             let img = match arch {
                 Arch::Riscv64 => demo::rv::hello(),

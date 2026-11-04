@@ -1,5 +1,5 @@
 //! RV64C: expand a 16-bit compressed instruction into its 32-bit equivalent.
-//! Returns `None` for illegal/reserved encodings (and for C.F* since F/D are absent).
+//! Returns `None` for illegal/reserved encodings.
 
 #[inline]
 fn bit(c: u32, n: u32) -> u32 {
@@ -20,6 +20,10 @@ fn i(op: u32, rd: u32, f3: u32, rs1: u32, imm: i32) -> u32 {
 fn s(f3: u32, rs1: u32, rs2: u32, imm: i32) -> u32 {
     let m = imm as u32;
     (m >> 5 & 0x7f) << 25 | rs2 << 20 | rs1 << 15 | f3 << 12 | (m & 0x1f) << 7 | 0x23
+}
+/// FP store (opcode STORE-FP).
+fn fs(f3: u32, rs1: u32, rs2: u32, imm: i32) -> u32 {
+    s(f3, rs1, rs2, imm) ^ 0x23 ^ 0x27
 }
 fn b(f3: u32, rs1: u32, rs2: u32, imm: i32) -> u32 {
     let m = imm as u32;
@@ -62,6 +66,8 @@ pub fn expand(c: u16) -> Option<u32> {
             }
             i(0x13, rdp, 0, 2, imm as i32)
         }
+        (0, 1) => i(0x07, rdp, 3, rs1p, ((c >> 10 & 7) << 3 | (c >> 5 & 3) << 6) as i32),             // C.FLD
+        (0, 5) => fs(3, rs1p, rdp, ((c >> 10 & 7) << 3 | (c >> 5 & 3) << 6) as i32),                  // C.FSD
         (0, 2) => i(0x03, rdp, 2, rs1p, ((c >> 10 & 7) << 3 | bit(c, 6) << 2 | bit(c, 5) << 6) as i32), // C.LW
         (0, 3) => i(0x03, rdp, 3, rs1p, ((c >> 10 & 7) << 3 | (c >> 5 & 3) << 6) as i32),             // C.LD
         (0, 6) => s(2, rs1p, rdp, ((c >> 10 & 7) << 3 | bit(c, 6) << 2 | bit(c, 5) << 6) as i32),      // C.SW
@@ -122,6 +128,8 @@ pub fn expand(c: u16) -> Option<u32> {
 
         // ---------------- quadrant 2
         (2, 0) => i(0x13, rd, 1, rd, (bit(c, 12) << 5 | (c >> 2) & 31) as i32), // C.SLLI
+        (2, 1) => i(0x07, rd, 3, 2, (bit(c, 12) << 5 | (c >> 5 & 3) << 3 | (c >> 2 & 7) << 6) as i32), // C.FLDSP
+        (2, 5) => fs(3, 2, rs2, ((c >> 10 & 7) << 3 | (c >> 7 & 7) << 6) as i32),                       // C.FSDSP
         (2, 2) => {
             if rd == 0 {
                 return None;

@@ -2,6 +2,7 @@
 //!
 //! Layout:
 //!   bus      physical address space (RAM + MMIO devices)
+//!   fdt      device-tree blob writer
 //!   devices  UART (16550 / PL011), SiFive test finisher, CLINT, PLIC
 //!   cpu      instruction-set interpreters (riscv64, aarch64)
 //!   host     "semihosting" syscalls (exit / write)
@@ -12,8 +13,9 @@ pub mod bus;
 pub mod cpu;
 pub mod demo;
 pub mod devices;
+pub mod fdt;
 pub mod host;
 pub mod machine;
 pub mod virtio;
 
-pub use machine::{Arch, Machine, Stop};
+pub use machine::{is_linux_image, Arch, LinuxBoot, Machine, Stop};

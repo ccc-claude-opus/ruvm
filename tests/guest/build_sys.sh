@@ -16,10 +16,20 @@ A64="clang --target=aarch64-none-elf -march=armv8.1-a -mgeneral-regs-only -O2
 $RV -T rv_priv.ld -o out/rv_priv.elf rv_priv_start.S rv_priv.c
 $RV -T out/rv.ld  -o out/selftest_rvc.elf rv_start.S selftest.c      # C extension build
 $A64 -T out/a64.ld -o out/a64_priv.elf a64_priv_start.S a64_priv.c
-cp out/rv_priv.elf out/selftest_rvc.elf out/a64_priv.elf prebuilt/
+# F/D test (lp64d) and an S-mode SBI payload in Linux Image format
+$RV -march=rv64imafdc_zicsr -mabi=lp64d -T out/rv.ld -o out/rv_fp.elf rv_fp_start.S rv_fp.c
+sed 's/@BASE@/0x80200000/; s/stack_top = .;/stack_top = .;\n  _end = .;/' link.ld.in > out/rv_sbi.ld
+$RV -T out/rv_sbi.ld -o out/rv_sbi.elf rv_sbi.S
+riscv64-unknown-elf-objcopy -O binary out/rv_sbi.elf out/rv_sbi.Image
+cp out/rv_priv.elf out/selftest_rvc.elf out/a64_priv.elf out/rv_fp.elf out/rv_sbi.Image prebuilt/
+OPENSBI=$(dirname "$(command -v qemu-system-riscv64)")/../share/qemu/opensbi-riscv64-generic-fw_dynamic.bin
+[ -f "$OPENSBI" ] && cp "$OPENSBI" prebuilt/opensbi-fw_dynamic.bin
 
 if command -v qemu-system-riscv64 >/dev/null && command -v qemu-system-aarch64 >/dev/null; then
     timeout 20 qemu-system-riscv64 -M virt -bios none -nographic -kernel out/rv_priv.elf > prebuilt/rv_priv.expected
     timeout 20 qemu-system-aarch64 -M virt -cpu max -nographic -kernel out/a64_priv.elf > prebuilt/a64_priv.expected
+    timeout 60 qemu-system-riscv64 -M virt -bios none -nographic -kernel out/rv_fp.elf > prebuilt/rv_fp.expected
+    # QEMU's default firmware is OpenSBI: keep only what the payload printed
+    timeout 20 qemu-system-riscv64 -M virt -nographic -kernel out/rv_sbi.Image | sed -n '/S-mode payload/,$p' > prebuilt/rv_sbi.expected
     echo "reference output refreshed from qemu-system"
 fi

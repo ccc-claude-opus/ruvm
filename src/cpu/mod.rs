@@ -1,12 +1,15 @@
 pub mod aarch64;
 pub mod riscv;
 pub mod rvc;
+pub mod softfloat;
 
 use crate::bus::Bus;
 use crate::machine::Stop;
 
 /// Interface every emulated CPU implements.
-pub trait Cpu {
+pub trait Cpu: std::any::Any {
+    /// For board code that needs the concrete CPU type (boot set-up).
+    fn as_any(&mut self) -> &mut dyn std::any::Any;
     fn name(&self) -> &'static str;
     fn pc(&self) -> u64;
     fn set_pc(&mut self, pc: u64);

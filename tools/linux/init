@@ -1,0 +1,8 @@
+#!/bin/sh
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev 2>/dev/null
+echo
+echo "Welcome to ruvm Linux ($(uname -m))"
+[ -f /etc/autorun ] && . /etc/autorun
+exec setsid cttyhack /bin/sh

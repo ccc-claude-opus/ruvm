@@ -877,6 +877,9 @@ impl Default for Aarch64 {
 }
 
 impl Cpu for Aarch64 {
+    fn as_any(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
     fn name(&self) -> &'static str {
         "aarch64"
     }
