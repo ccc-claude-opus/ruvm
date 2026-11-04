@@ -1,0 +1,47 @@
+M: hello
+M: ecall from M
+M: illegal instruction, mtval=0x00000000f1401073
+M: mhartid=0x0000000000000000
+M: misa has S,U = 0x0000000000000002
+M: mideleg=0x0000000000000222
+S: hello
+S: satp mode=0x0000000000000008
+S: secret via high alias=0x00000000005ec2e7
+S: M-mode MPRV load=0x00000000005ec2e7
+S: S load page fault, stval=0x0000008000000000
+S: S store page fault, stval=0xffffffc000000000
+S: S load page fault, stval=0x0000000040001000
+S: U page without SUM -> 0x000000000000dead
+S: U page with SUM    -> 0x1122334455667788
+S: S load page fault, stval=0x0000000040003000
+S: X-only page        -> 0x000000000000dead
+S: X-only page + MXR  -> 0x1122334455667788
+S: instruction page fault, stval=0x0000000040000000
+S: illegal insn from S, stval=0x00000000300022f3
+M: breakpoint from priv 0x0000000000000001
+M: misaligned AMO, mtval=0x0000000000000529
+S: user A/D before = 0x0000000000000000
+S: entering U mode
+U
+U: 0x1122334455667788
+U: 0x0000000000001234
+S: U load page fault, stval=0x0000000040005000
+S: U store page fault, stval=0x0000000040000000
+S: illegal insn from U, stval=0x0000000010002573
+S: U load page fault, stval=0x0000000080000000
+U: 0x000000000000000a
+S: back from U mode
+S: user code PTE A/D = 0x0000000000000040
+S: user data PTE A/D = 0x00000000000000c0
+S: software interrupts taken=0x0000000000000001
+S: timer ticks=0x0000000000000001
+S: time advanced=0x0000000000000001
+M: software interrupt
+S: M soft irq seen=0x0000000000000001
+S: external irq, claim=0x000000000000000a
+S: uart IIR=0x0000000000000002
+S: external irq, claim=0x000000000000000a
+S: uart IIR=0x0000000000000001
+S: external irqs=0x0000000000000002
+S: PLIC pending after complete=0x0000000000000000
+S: done

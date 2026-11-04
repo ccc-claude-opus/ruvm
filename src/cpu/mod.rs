@@ -1,5 +1,6 @@
 pub mod aarch64;
 pub mod riscv;
+pub mod rvc;
 
 use crate::bus::Bus;
 use crate::machine::Stop;

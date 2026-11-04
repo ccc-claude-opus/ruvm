@@ -3,6 +3,11 @@
 A small QEMU-like machine emulator in Rust (no dependencies). It interprets
 **RISC-V 64** and **AArch64** guests on a QEMU-`virt`-style board.
 
+v0.2 adds the system-level pieces needed for kernels: RISC-V M/S/U modes with
+trap delegation, Sv39 paging, the C extension, CLINT timer/software interrupts and
+a PLIC; AArch64 EL0/EL1 exceptions, exclusives and LSE atomics. Both are checked
+instruction-for-instruction against `qemu-system-*` (see [doc/v0.2.md](doc/v0.2.md)).
+
 ```
 cargo build --release
 ./target/release/ruvm -M riscv64 -demo hello
@@ -13,9 +18,13 @@ cargo build --release
 | | riscv64 | aarch64 |
 |---|---|---|
 | RAM | `0x8000_0000` | `0x4000_0000` |
-| UART | NS16550 @ `0x1000_0000` | PL011 @ `0x0900_0000` |
+| UART | NS16550 @ `0x1000_0000` (PLIC irq 10) | PL011 @ `0x0900_0000` |
+| Interrupts | CLINT @ `0x0200_0000`, PLIC @ `0x0c00_0000` | — |
 | Power-off | write `0x5555` to `0x10_0000` (SiFive test finisher) | PSCI `SYSTEM_OFF` via `HVC`/`SMC` |
-| Host syscalls | `ecall`, a7=93 exit / 64 write (while `mtvec==0`) | `svc #0`, x8=93 exit / 64 write |
+| Host syscalls | `ecall`, a7=93 exit / 64 write (M-mode, while `mtvec==0`) | `svc #0`, x8=93 exit / 64 write (while `VBAR_EL1==0`) |
+
+`mtime` / `CNTVCT_EL0` advance one tick per executed instruction (reported as 10 MHz),
+so runs are deterministic; `WFI` with nothing pending skips ahead to the next timer deadline.
 
 Images: ELF64 (little-endian, `PT_LOAD` segments, entry = start PC) or raw binary
 (loaded at the start of RAM). Exit status of `ruvm` is the guest's exit code.
@@ -23,10 +32,11 @@ Images: ELF64 (little-endian, `PT_LOAD` segments, entry = start PC) or raw binar
 ## Layout
 
 ```
-src/bus.rs        physical address space: RAM + MMIO devices
-src/devices.rs    UART (16550 / PL011), test finisher
-src/cpu/riscv.rs  RV64IMA + Zicsr, M-mode traps
-src/cpu/aarch64.rs  A64 integer subset
+src/bus.rs        physical address space: RAM, CLINT, PLIC, MMIO devices + IRQ lines
+src/devices.rs    UART (16550 / PL011), test finisher, CLINT, PLIC
+src/cpu/riscv.rs  RV64IMAC + Zicsr, M/S/U, Sv39 MMU + TLB, interrupts
+src/cpu/rvc.rs    compressed-instruction expander
+src/cpu/aarch64.rs  A64 integer subset, EL0/EL1 exceptions, exclusives, LSE
 src/host.rs       Linux-style exit/write "semihosting"
 src/machine.rs    board wiring, ELF/raw loader, run loop
 src/demo.rs       tiny encoders + built-in hello programs
@@ -40,14 +50,20 @@ add a memory map in `Machine::new`.
 `cargo test` runs hand-assembled programs plus prebuilt guest ELFs:
 
 * a gcc-compiled C program (`-O2`, RISC-V and AArch64) whose output must equal the native x86 build;
+* the same C program built for `rv64imac` (compressed instructions);
 * two assembly programs executing ~300 instruction variants over 361 operand pairs,
-  whose raw result/NZCV dumps must hash-match `qemu-riscv64` / `qemu-aarch64`.
+  whose raw result/NZCV dumps must hash-match `qemu-riscv64` / `qemu-aarch64`;
+* two full-system tests whose console output must equal `qemu-system-riscv64 -M virt -bios none`
+  and `qemu-system-aarch64 -M virt -cpu max` byte for byte:
+  `rv_priv` (M→S→U, delegation, Sv39, A/D, SUM/MXR/MPRV, timer/software/PLIC interrupts) and
+  `a64_priv` (vectors, SVC/BRK/UDF/aborts from EL1 and EL0, ERET, SPSel, DAIF, LSE, CAS, LDXR/STXR).
 
-`tests/guest/build.sh` rebuilds all of it (needs the cross gcc toolchains; refreshes
-reference hashes if qemu-user is installed).
+`tests/guest/build.sh` rebuilds the user-level programs (Linux cross gcc, qemu-user);
+`tests/guest/build_sys.sh` rebuilds the system tests (`riscv64-unknown-elf-gcc`, clang/lld,
+qemu-system) and refreshes their reference output.
 
 ## Not implemented (yet)
 
-Both: MMU / paging, interrupts and timers, device tree, SIMD/FP, multi-core, block/net devices, JIT.
-RISC-V: C (compressed), F/D, S/U modes. AArch64: exception levels & vectors, exclusives/atomics
-(`LDXR`/`STXR`/LSE), FP/NEON; `MRS`/`MSR` only has `NZCV`, `CurrentEL` and a plain register file.
+Both: device tree, SIMD/FP, multi-core, block/net devices (virtio), JIT.
+RISC-V: F/D, PMP enforcement, Sv48/57, Sstc. AArch64: MMU, GIC + generic-timer interrupts,
+EL2/EL3, FP/NEON.

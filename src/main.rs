@@ -2,7 +2,7 @@ use ruvm::{demo, Arch, Machine, Stop};
 use std::process::exit;
 
 const USAGE: &str = "\
-ruvm — a tiny QEMU-like emulator (RISC-V 64 / AArch64)
+ruvm 0.2 — a tiny QEMU-like emulator (RISC-V 64 / AArch64)
 
 USAGE:
     ruvm -M <riscv64|aarch64> (-kernel <file> | -demo hello) [options]
@@ -18,13 +18,14 @@ OPTIONS:
     -serial stdio                 connect host stdin to the guest UART (default: output only)
     -h, --help                    this text
 
-MEMORY MAP:
-    riscv64   0x0010_0000 test finisher | 0x1000_0000 NS16550 UART | RAM 0x8000_0000
-    aarch64   0x0900_0000 PL011 UART                               | RAM 0x4000_0000
+MEMORY MAP (as QEMU virt):
+    riscv64   0x0010_0000 test finisher | 0x0200_0000 CLINT | 0x0c00_0000 PLIC
+              0x1000_0000 NS16550 UART (PLIC irq 10)        | RAM 0x8000_0000
+    aarch64   0x0900_0000 PL011 UART                        | RAM 0x4000_0000
 
 GUEST EXIT:
-    riscv64   write 0x5555 to 0x100000, or ecall a7=93 (exit) when mtvec==0
-    aarch64   HVC/SMC PSCI SYSTEM_OFF (x0=0x84000008), SVC x8=93 (exit), or HLT
+    riscv64   write 0x5555 to 0x100000, or ecall a7=93 (exit) from M-mode when mtvec==0
+    aarch64   HVC/SMC PSCI SYSTEM_OFF (x0=0x84000008), HLT, or SVC x8=93 (exit) when VBAR_EL1==0
 ";
 
 fn die(msg: &str) -> ! {

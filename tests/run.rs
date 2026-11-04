@@ -119,3 +119,37 @@ fn alu_dump_matches_qemu() {
         assert_eq!(got, expected(exp), "{arch} output differs from qemu reference");
     }
 }
+
+/// The C-extension (rv64imac) build of the same C program.
+#[test]
+fn compressed_selftest_matches_native() {
+    let want = expected("selftest.expected");
+    assert_eq!(String::from_utf8(run_elf("riscv64", "selftest_rvc.elf")).unwrap(), want);
+}
+
+/// Full-system tests (privilege modes, traps, paging, interrupts): the console output
+/// must equal what qemu-system-* printed for the same ELF (tests/guest/build_sys.sh).
+#[test]
+fn riscv_privileged_matches_qemu_system() {
+    let out = String::from_utf8(run_elf("riscv64", "rv_priv.elf")).unwrap();
+    assert_eq!(out, expected("rv_priv.expected"));
+}
+
+#[test]
+fn aarch64_exceptions_match_qemu_system() {
+    let out = String::from_utf8(run_elf("aarch64", "a64_priv.elf")).unwrap();
+    assert_eq!(out, expected("a64_priv.expected"));
+}
+
+#[test]
+fn riscv_compressed_hand_assembled() {
+    // c.li a0, 7 ; c.addi a0, 3 ; c.li a7, 0 ; c.addi a7, 31 x3 ; ecall  -> exit(10)
+    let mut img = Vec::new();
+    for h in [0x451du16, 0x050d, 0x4881, 0x08fd, 0x08fd, 0x08fd] {
+        img.extend_from_slice(&h.to_le_bytes());
+    }
+    img.extend_from_slice(&rv::ecall().to_le_bytes());
+    let mut m = Machine::new(Arch::Riscv64, 4, false);
+    m.load_raw(Arch::Riscv64.ram_base(), &img).unwrap();
+    assert_eq!(m.run(Some(100)), Stop::Halt(10));
+}

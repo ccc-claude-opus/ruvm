@@ -2,7 +2,7 @@
 //!
 //! Layout:
 //!   bus      physical address space (RAM + MMIO devices)
-//!   devices  UART (16550 / PL011), SiFive test finisher
+//!   devices  UART (16550 / PL011), SiFive test finisher, CLINT, PLIC
 //!   cpu      instruction-set interpreters (riscv64, aarch64)
 //!   host     "semihosting" syscalls (exit / write)
 //!   machine  glues CPU + bus together, loads ELF / raw images

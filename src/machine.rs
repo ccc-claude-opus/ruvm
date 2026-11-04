@@ -51,15 +51,19 @@ pub struct Machine {
 }
 
 impl Machine {
-    /// Memory map
-    ///   riscv64: 0x0010_0000 test finisher, 0x1000_0000 NS16550 UART, RAM @ 0x8000_0000
+    /// Memory map (same addresses as QEMU's `virt` boards)
+    ///   riscv64: 0x0010_0000 test finisher, 0x0200_0000 CLINT, 0x0c00_0000 PLIC,
+    ///            0x1000_0000 NS16550 UART (PLIC irq 10), RAM @ 0x8000_0000
     ///   aarch64: 0x0900_0000 PL011 UART,                              RAM @ 0x4000_0000
     pub fn new(arch: Arch, ram_mb: usize, interactive: bool) -> Machine {
         let mut bus = Bus::new(arch.ram_base(), ram_mb << 20);
+        bus.interactive = interactive;
         let cpu: Box<dyn Cpu> = match arch {
             Arch::Riscv64 => {
                 bus.map(0x10_0000, 0x1000, Box::new(TestFinisher::default()));
-                bus.map(0x1000_0000, 0x100, Box::new(Uart::new(UartKind::Ns16550, interactive)));
+                bus.map_clint(0x200_0000);
+                bus.map_plic(0xc00_0000);
+                bus.map_irq(0x1000_0000, 0x100, 10, Box::new(Uart::new(UartKind::Ns16550, interactive)));
                 Box::new(Riscv64::new())
             }
             Arch::Aarch64 => {
@@ -131,10 +135,14 @@ impl Machine {
                 eprintln!("[{:>10}] {:#018x}: {:08x}", self.insns, pc, raw);
             }
             self.insns += 1;
+            self.bus.clint.mtime += 1;
+            if self.bus.interactive && self.insns & 0xfff == 0 {
+                self.bus.poll_irqs(); // pick up host keyboard input
+            }
             if let Err(s) = self.cpu.step(&mut self.bus) {
                 return s;
             }
-            if let Some(code) = self.bus.halted() {
+            if let Some(code) = self.bus.halt {
                 return Stop::Halt(code);
             }
         }
