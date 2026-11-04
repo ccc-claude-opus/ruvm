@@ -205,3 +205,28 @@ fn builtin_sbi_matches_opensbi_on_qemu() {
 fn opensbi_firmware_boots_payload() {
     assert_eq!(sbi_payload(&["-bios", "@DIR@/opensbi-fw_dynamic.bin"]), expected("rv_sbi.expected"));
 }
+
+/// Debian's stock riscv64 kernel + installer initrd (tools/linux/fetch-debian.sh) boots
+/// to a busybox shell, runs commands and powers off. Slow (~1 min): run with
+/// `cargo test --release -- --ignored`.
+#[test]
+#[ignore]
+fn debian_linux_riscv64_boots_to_shell() {
+    let dir = format!("{}/tests/guest/out/linux/debian/riscv64", env!("CARGO_MANIFEST_DIR"));
+    if !std::path::Path::new(&format!("{dir}/linux")).exists() {
+        eprintln!("skipped: run tools/linux/fetch-debian.sh first");
+        return;
+    }
+    let out = Command::new(env!("CARGO_BIN_EXE_ruvm"))
+        .args(["-M", "riscv64", "-m", "512", "-kernel", &format!("{dir}/linux")])
+        .args(["-initrd", &format!("{dir}/initrd.gz"), "-append", "console=ttyS0 rdinit=/bin/sh"])
+        .args(["-send-after", "# ", "mount -t proc p /proc; uname -sm; grep isa /proc/cpuinfo; echo 6*7=$((6*7))\\n"])
+        .args(["-send-after", "=42", "\\npoweroff -f\\n", "-icount", "10000000000"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "did not power off cleanly:\n{text}");
+    for want in ["Run /bin/sh as init process", "Linux riscv64", "rv64imafdc", "6*7=42", "reboot: Power down"] {
+        assert!(text.contains(want), "missing {want:?} in:\n{text}");
+    }
+}

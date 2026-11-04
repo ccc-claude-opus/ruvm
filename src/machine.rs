@@ -2,7 +2,7 @@
 
 use crate::bus::Bus;
 use crate::cpu::{aarch64::Aarch64, riscv::Riscv64, Cpu};
-use crate::devices::{forward_stdin, Clint, TestFinisher, Uart, UartKind};
+use crate::devices::{forward_stdin, Clint, SharedScript, TestFinisher, Uart, UartKind};
 use crate::fdt::Fdt;
 use std::sync::mpsc::{channel, Sender};
 use crate::virtio::VirtioBlk;
@@ -52,6 +52,7 @@ pub struct Machine {
     pub trace: bool,
     pub insns: u64,
     console_tx: Sender<u8>,
+    script: SharedScript,
     ram_mb: usize,
     has_disk: bool,
 }
@@ -89,20 +90,21 @@ impl Machine {
             forward_stdin(console_tx.clone());
         }
         let rx = Some(console_rx);
+        let script = SharedScript::default();
         let cpu: Box<dyn Cpu> = match arch {
             Arch::Riscv64 => {
                 bus.map(0x10_0000, 0x1000, Box::new(TestFinisher::default()));
                 bus.map_clint(0x200_0000);
                 bus.map_plic(0xc00_0000);
-                bus.map_irq(0x1000_0000, 0x100, 10, Box::new(Uart::new(UartKind::Ns16550, rx)));
+                bus.map_irq(0x1000_0000, 0x100, 10, Box::new(Uart::new(UartKind::Ns16550, rx, script.clone())));
                 Box::new(Riscv64::new())
             }
             Arch::Aarch64 => {
-                bus.map(0x0900_0000, 0x1000, Box::new(Uart::new(UartKind::Pl011, rx)));
+                bus.map(0x0900_0000, 0x1000, Box::new(Uart::new(UartKind::Pl011, rx, script.clone())));
                 Box::new(Aarch64::new())
             }
         };
-        let mut m = Machine { arch, cpu, bus, trace: false, insns: 0, console_tx, ram_mb, has_disk: false };
+        let mut m = Machine { arch, cpu, bus, trace: false, insns: 0, console_tx, script, ram_mb, has_disk: false };
         m.cpu.set_pc(arch.ram_base());
         m
     }
@@ -112,6 +114,12 @@ impl Machine {
         for &b in bytes {
             let _ = self.console_tx.send(b);
         }
+    }
+
+    /// Type `text` on the console once the guest has printed `wait_for`
+    /// (steps run in order; an empty pattern types immediately after the previous step).
+    pub fn send_input_after(&self, wait_for: &[u8], text: &[u8]) {
+        self.script.lock().unwrap().push(wait_for, text);
     }
 
     /// Attach a raw disk image as a virtio-mmio block device

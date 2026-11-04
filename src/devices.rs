@@ -2,7 +2,9 @@
 
 use crate::bus::Device;
 use std::io::{Read, Write};
+use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum UartKind {
@@ -12,9 +14,50 @@ pub enum UartKind {
     Pl011,
 }
 
+/// Expect-style console input: each step types its text once the guest's console
+/// output ends with the step's pattern (like `expect`/`send`).
+#[derive(Default)]
+pub struct ConsoleScript {
+    steps: VecDeque<(Vec<u8>, Vec<u8>)>,
+    seen: Vec<u8>,
+    typed: VecDeque<u8>,
+}
+
+impl ConsoleScript {
+    pub fn push(&mut self, wait_for: &[u8], text: &[u8]) {
+        self.steps.push_back((wait_for.to_vec(), text.to_vec()));
+        self.advance();
+    }
+
+    fn advance(&mut self) {
+        while let Some((pat, _)) = self.steps.front() {
+            if !self.seen.ends_with(pat) {
+                break;
+            }
+            let (_, text) = self.steps.pop_front().unwrap();
+            self.typed.extend(text);
+            self.seen.clear();
+        }
+    }
+
+    fn output(&mut self, b: u8) {
+        if self.steps.is_empty() {
+            return;
+        }
+        self.seen.push(b);
+        if self.seen.len() > 4096 {
+            self.seen.drain(..2048);
+        }
+        self.advance();
+    }
+}
+
+pub type SharedScript = Arc<Mutex<ConsoleScript>>;
+
 pub struct Uart {
     kind: UartKind,
     rx: Option<Receiver<u8>>,
+    script: SharedScript,
     pending: Option<u8>,
     // 16550 registers
     ier: u8,
@@ -29,12 +72,16 @@ pub struct Uart {
 }
 
 impl Uart {
-    /// `rx`: bytes the guest will receive (host stdin, scripted input, ...).
-    pub fn new(kind: UartKind, rx: Option<Receiver<u8>>) -> Self {
-        Uart { kind, rx, pending: None, ier: 0, lcr: 0, mcr: 0, scr: 0, fcr: 0, dll: 0, dlm: 0, thre: false }
+    /// `rx`: bytes the guest will receive (host stdin, scripted input, ...);
+    /// `script`: expect-style input that waits for console output.
+    pub fn new(kind: UartKind, rx: Option<Receiver<u8>>, script: SharedScript) -> Self {
+        Uart { kind, rx, script, pending: None, ier: 0, lcr: 0, mcr: 0, scr: 0, fcr: 0, dll: 0, dlm: 0, thre: false }
     }
 
     fn rx_ready(&mut self) -> bool {
+        if self.pending.is_none() {
+            self.pending = self.script.lock().unwrap().typed.pop_front();
+        }
         if self.pending.is_none() {
             if let Some(rx) = &self.rx {
                 self.pending = rx.try_recv().ok();
@@ -47,6 +94,7 @@ impl Uart {
         let mut out = std::io::stdout().lock();
         let _ = out.write_all(&[b]);
         let _ = out.flush();
+        self.script.lock().unwrap().output(b);
     }
 
     fn dlab(&self) -> bool {

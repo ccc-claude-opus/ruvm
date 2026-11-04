@@ -8,6 +8,15 @@ trap delegation, Sv39 paging, the C extension, CLINT timer/software interrupts a
 a PLIC; AArch64 EL0/EL1 exceptions, exclusives and LSE atomics. Both are checked
 instruction-for-instruction against `qemu-system-*` (see [doc/v0.2.md](doc/v0.2.md)).
 
+**v0.5 boots Linux on RISC-V**: Debian 13's stock riscv64 kernel (6.12) runs to a
+busybox shell and powers off cleanly ([doc/v0.5.md](doc/v0.5.md)):
+
+```
+tools/linux/fetch-debian.sh riscv64
+./target/release/ruvm -M riscv64 -m 512 -kernel tests/guest/out/linux/debian/riscv64/linux \
+    -initrd tests/guest/out/linux/debian/riscv64/initrd.gz -append "console=ttyS0 rdinit=/bin/sh" -serial stdio
+```
+
 v0.4 adds bit-exact F/D floating point, a device-tree generator, a built-in SBI and the
 Linux `Image` boot protocol (`-kernel/-initrd/-append`), and runs real OpenSBI firmware
 (`-bios`) ([doc/v0.4.md](doc/v0.4.md)).
@@ -80,6 +89,8 @@ add a memory map in `Machine::new`.
   results + flags equal to qemu-system-riscv64;
 * `rv_sbi`: an S-mode payload printing through SBI gives the same output with ruvm's
   built-in SBI, with OpenSBI running on ruvm, and with OpenSBI on QEMU;
+* (ignored by default, `cargo test --release -- --ignored`) Debian's riscv64 Linux boots to a
+  shell, runs commands and powers off;
 * xv6-riscv boots from the virtio disk and runs shell commands typed with `-input`
   (`tests/guest/build_xv6.sh` rebuilds the pinned kernel and file system).
 

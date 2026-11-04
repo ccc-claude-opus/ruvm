@@ -231,12 +231,13 @@ impl Riscv64 {
         self.csr[MENVCFG] = 1 << 63 | 1 << 61; // STCE (Sstc), ADUE (hardware A/D)
     }
 
-    /// SBI v2.0 subset: BASE, TIME, IPI, RFENCE, HSM, SRST, DBCN and the legacy calls.
+    /// SBI v2.0 subset: BASE, TIME, IPI, RFENCE, HSM, SRST, DBCN, PMU and the legacy calls.
     fn sbi_call(&mut self, bus: &mut Bus) -> Result<(), Stop> {
         const NOT_SUPPORTED: u64 = -2i64 as u64;
         const INVALID_PARAM: u64 = -3i64 as u64;
         const ALREADY_AVAILABLE: u64 = -6i64 as u64;
-        const EXTS: [u64; 7] = [0x10, 0x5449_4d45, 0x73_5049, 0x5246_4e43, 0x48_534d, 0x5352_5354, 0x4442_434e];
+        const EXTS: [u64; 8] =
+            [0x10, 0x5449_4d45, 0x73_5049, 0x5246_4e43, 0x48_534d, 0x5352_5354, 0x4442_434e, 0x50_4d55];
         let (eid, fid) = (self.x[17], self.x[16]);
         let a = [self.x[10], self.x[11], self.x[12]];
         // console output, with "\n" -> "\r\n" like OpenSBI
@@ -282,6 +283,15 @@ impl Riscv64 {
                 _ => (NOT_SUPPORTED, 0),
             },
             0x5352_5354 if fid == 0 => return Err(Stop::Halt((a[1] != 0) as i32)), // system_reset
+            // PMU: just the fixed cycle (0) and instret (2) counters, no events. Linux's
+            // driver needs this to grant user-mode `rdtime` (it then sets scounteren).
+            0x50_4d55 => match fid {
+                0 => (0, 3),                                                   // num_counters
+                1 if a[0] == 0 || a[0] == 2 => (0, 0xc00 + a[0] | 63 << 12),   // counter_get_info
+                1 => (INVALID_PARAM, 0),
+                3 | 4 => (0, 0),                                               // start / stop
+                _ => (NOT_SUPPORTED, 0),                                       // cfg_match, fw_read, ...
+            },
             0x4442_434e => match fid {
                 0 => {
                     let base = a[1] | a[2] << 32;

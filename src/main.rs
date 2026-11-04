@@ -2,7 +2,7 @@ use ruvm::{demo, is_linux_image, Arch, LinuxBoot, Machine, Stop};
 use std::process::exit;
 
 const USAGE: &str = "\
-ruvm 0.4 — a tiny QEMU-like emulator (RISC-V 64 / AArch64)
+ruvm 0.5 — a tiny QEMU-like emulator (RISC-V 64 / AArch64)
 
 USAGE:
     ruvm -M <riscv64|aarch64> (-kernel <file> | -demo hello) [options]
@@ -20,6 +20,7 @@ OPTIONS:
     -drive file=<img>[,...]       raw disk image as virtio-mmio block device (writes go to the file)
     -snapshot                     keep disk writes in memory (image file is not modified)
     -input <text>                 type <text> on the guest console at start (\\n = newline)
+    -send-after <pattern> <text>  type <text> once the console has printed <pattern> (repeatable)
     -icount <N>                   stop after N instructions
     -d, --trace                   trace every instruction (pc + raw word) to stderr
     -regs                         dump CPU registers on exit
@@ -46,6 +47,7 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let (mut arch, mut kernel, mut demo_name, mut drive) = (None, None, None, None);
     let (mut snapshot, mut input) = (false, String::new());
+    let mut expects: Vec<(String, String)> = Vec::new();
     let (mut initrd, mut append, mut bios, mut dumpdtb) = (None, String::new(), None, None);
     let (mut ram, mut icount, mut trace, mut regs, mut interactive) = (128usize, None, false, false, false);
 
@@ -74,6 +76,10 @@ fn main() {
             "-bios" => bios = Some(val("-bios")).filter(|b| b != "none"),
             "-dumpdtb" => dumpdtb = Some(val("-dumpdtb")),
             "-input" => input += &val("-input").replace("\\n", "\n"),
+            "-send-after" => {
+                let pat = val("-send-after").replace("\\n", "\n");
+                expects.push((pat, val("-send-after").replace("\\n", "\n")));
+            }
             "-serial" => interactive = val("-serial") == "stdio",
             "-h" | "--help" => {
                 print!("{USAGE}");
@@ -87,6 +93,9 @@ fn main() {
     let mut vm = Machine::new(arch, ram, interactive);
     vm.trace = trace;
     vm.send_input(input.as_bytes());
+    for (pat, text) in &expects {
+        vm.send_input_after(pat.as_bytes(), text.as_bytes());
+    }
     if let Some(path) = drive {
         if let Err(e) = vm.attach_disk(&path, snapshot) {
             die(&e);
