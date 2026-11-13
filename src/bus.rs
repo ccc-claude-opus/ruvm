@@ -28,6 +28,13 @@ pub trait Device {
     }
     /// Called after every register write: bus-mastering devices (virtio) access RAM here.
     fn dma(&mut self, _mem: &mut Dma) {}
+    /// Called periodically (every few thousand instructions): devices with asynchronous
+    /// work (network receive) complete it here.
+    fn poll(&mut self, _mem: &mut Dma) {}
+    /// The guest asked the machine to reset (reboot).
+    fn reset_request(&self) -> bool {
+        false
+    }
 }
 
 /// A device's view of guest RAM for DMA. Accesses outside RAM return `None`.
@@ -92,6 +99,8 @@ pub struct Bus {
     gic_base: Option<u64>,
     /// Set when a device asked to power off.
     pub halt: Option<i32>,
+    /// Set when the guest asked for a reset (reboot).
+    pub reset: bool,
     /// Host stdin is connected: idle loops (WFI) should really sleep.
     pub interactive: bool,
 }
@@ -112,6 +121,7 @@ impl Bus {
             gic: Gic::default(),
             gic_base: None,
             halt: None,
+            reset: false,
             interactive: false,
         }
     }
@@ -245,6 +255,9 @@ impl Bus {
         if let Some(c) = m.dev.halt_code() {
             self.halt = Some(c);
         }
+        if m.dev.reset_request() {
+            self.reset = true;
+        }
         if m.irq != 0 {
             self.poll_irqs();
         }
@@ -258,6 +271,7 @@ impl Bus {
             return;
         }
         for m in &mut self.devs {
+            m.dev.poll(&mut Dma { ram: &mut self.ram, base: self.ram_base });
             if m.irq != 0 {
                 let level = m.dev.irq();
                 if plic {

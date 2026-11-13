@@ -1,8 +1,9 @@
+use ruvm::machine::DevSpec;
 use ruvm::{demo, is_linux_image, Arch, LinuxBoot, Machine, Stop};
 use std::process::exit;
 
 const USAGE: &str = "\
-ruvm 0.6 — a tiny QEMU-like emulator (RISC-V 64 / AArch64)
+ruvm 0.7 — a tiny QEMU-like emulator (RISC-V 64 / AArch64)
 
 USAGE:
     ruvm -M <riscv64|aarch64> (-kernel <file> | -demo hello) [options]
@@ -18,7 +19,11 @@ OPTIONS:
     -demo <name>                  built-in demo program: hello
     -m <MiB>                      RAM size in MiB (default 128)
     -drive file=<img>[,...]       raw disk image as virtio-mmio block device (writes go to the file)
+    -drive file=<img> may be repeated (virtio-blk devices in order, then virtio-rng)
     -snapshot                     keep disk writes in memory (image file is not modified)
+    -rng, -rng-seed <n>           attach a virtio-rng device (fixed seed for reproducible runs)
+    -rtc <secs>                   start the RTC at this Unix time (default: host clock)
+    -no-reboot                    exit instead of rebooting when the guest resets
     -input <text>                 type <text> on the guest console at start (\\n = newline)
     -send-after <pattern> <text>  type <text> once the console has printed <pattern> (repeatable)
     -icount <N>                   stop after N instructions
@@ -45,7 +50,9 @@ fn die(msg: &str) -> ! {
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let (mut arch, mut kernel, mut demo_name, mut drive) = (None, None, None, None);
+    let (mut arch, mut kernel, mut demo_name) = (None, None, None);
+    let mut drives: Vec<String> = Vec::new();
+    let (mut rng, mut rng_seed, mut rtc, mut no_reboot) = (false, None, None, false);
     let (mut snapshot, mut input) = (false, String::new());
     let mut expects: Vec<(String, String)> = Vec::new();
     let (mut initrd, mut append, mut bios, mut dumpdtb) = (None, String::new(), None, None);
@@ -64,13 +71,20 @@ fn main() {
                 let v = val("-drive");
                 // accept QEMU syntax: file=fs.img,if=none,format=raw,...
                 let file = v.split(',').find_map(|kv| kv.strip_prefix("file=")).unwrap_or(&v).to_string();
-                drive = Some(file);
+                drives.push(file);
             }
             "-m" => ram = val("-m").parse().unwrap_or_else(|_| die("-m expects a number of MiB")),
             "-icount" => icount = Some(val("-icount").parse().unwrap_or_else(|_| die("bad -icount"))),
             "-d" | "--trace" => trace = true,
             "-regs" => regs = true,
             "-snapshot" => snapshot = true,
+            "-rng" => rng = true,
+            "-rng-seed" => {
+                rng = true;
+                rng_seed = Some(val("-rng-seed").parse().unwrap_or_else(|_| die("bad -rng-seed")));
+            }
+            "-rtc" => rtc = Some(val("-rtc").parse().unwrap_or_else(|_| die("-rtc expects seconds since the epoch"))),
+            "-no-reboot" => no_reboot = true,
             "-initrd" => initrd = Some(val("-initrd")),
             "-append" => append = val("-append"),
             "-bios" => bios = Some(val("-bios")).filter(|b| b != "none"),
@@ -91,15 +105,19 @@ fn main() {
 
     let arch = arch.unwrap_or_else(|| die("missing -M <riscv64|aarch64>"));
     let mut vm = Machine::new(arch, ram, interactive);
+    vm.set_rtc_epoch(rtc);
     vm.trace = trace;
     vm.send_input(input.as_bytes());
     for (pat, text) in &expects {
         vm.send_input_after(pat.as_bytes(), text.as_bytes());
     }
-    if let Some(path) = drive {
-        if let Err(e) = vm.attach_disk(&path, snapshot) {
+    for path in &drives {
+        if let Err(e) = vm.attach_disk(path, snapshot) {
             die(&e);
         }
+    }
+    if rng {
+        vm.attach(DevSpec::Rng(rng_seed)).unwrap_or_else(|e| die(&e));
     }
 
     let loaded = match (kernel, demo_name) {
@@ -141,7 +159,14 @@ fn main() {
         die(&e);
     }
 
-    let stop = vm.run(icount);
+    // the RTC start time must be known before the board is (re)built
+    let mut stop = vm.run(icount);
+    while stop == Stop::Reset && !no_reboot {
+        if let Err(e) = vm.reset() {
+            die(&e);
+        }
+        stop = vm.run(icount);
+    }
     if regs || matches!(stop, Stop::Fatal(_)) {
         eprintln!("--- {} registers ---\n{}", vm.cpu.name(), vm.cpu.dump());
     }
@@ -155,5 +180,6 @@ fn main() {
             eprintln!("ruvm: fatal: {msg}");
             exit(1)
         }
+        Stop::Reset => exit(0), // -no-reboot
     }
 }

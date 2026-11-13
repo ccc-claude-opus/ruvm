@@ -1080,7 +1080,8 @@ impl Aarch64 {
                 return Err(self.undef(i));
             }
             self.x[0] = match self.x[0] as u32 {
-                0x8400_0008 | 0x8400_0009 => return Err(Stop::Halt(0).into()), // SYSTEM_OFF / SYSTEM_RESET
+                0x8400_0008 => return Err(Stop::Halt(0).into()), // SYSTEM_OFF
+                0x8400_0009 => return Err(Stop::Reset.into()),   // SYSTEM_RESET
                 0x8400_0000 => 0x0001_0000,                                     // PSCI_VERSION 1.0
                 _ => (-1i64) as u64,                                            // NOT_SUPPORTED
             };

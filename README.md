@@ -8,6 +8,17 @@ trap delegation, Sv39 paging, the C extension, CLINT timer/software interrupts a
 a PLIC; AArch64 EL0/EL1 exceptions, exclusives and LSE atomics. Both are checked
 instruction-for-instruction against `qemu-system-*` (see [doc/v0.2.md](doc/v0.2.md)).
 
+**v0.7: a usable system** — ext4 root on virtio-blk, virtio-rng, RTC, real reboot; both architectures
+boot from a disk image, write to it and keep the data across a reboot ([doc/v0.7.md](doc/v0.7.md)):
+
+```
+tools/linux/fetch-debian.sh && tools/linux/mkroot.sh
+./target/release/ruvm -M riscv64 -m 256 -kernel tests/guest/out/linux/debian/riscv64/linux \
+    -initrd tests/guest/out/linux/root/riscv64/initramfs.cpio.gz \
+    -drive file=tests/guest/out/linux/root/riscv64/root.ext4 -rng \
+    -append "console=ttyS0 rdinit=/init" -serial stdio
+```
+
 **v0.6 boots Linux on AArch64 too**: Debian 13's stock arm64 kernel (6.12) reaches a busybox
 shell and powers off through PSCI — MMU, GICv2, generic timer, PL011, FP and Advanced SIMD, all checked against
 `qemu-system-aarch64` ([doc/v0.6.md](doc/v0.6.md)):
@@ -73,7 +84,7 @@ src/cpu/riscv.rs  RV64IMAFDC + Zicsr, M/S/U, Sv39 MMU + TLB, interrupts, built-i
 src/cpu/softfloat.rs  bit-exact IEEE 754 binary32/64 (all rounding modes, flags)
 src/fdt.rs        device-tree blob writer
 src/cpu/rvc.rs    compressed-instruction expander
-src/virtio.rs     virtio-mmio (v2) block device with DMA
+src/virtio/        virtio-mmio (v2) transport; blk / rng / net back-ends
 src/cpu/aarch64.rs  A64 core: integer, EL0/EL1 exceptions, exclusives, LSE, generic timer, IRQs
 src/cpu/aarch64/    mmu.rs (stage-1 MMU), fp.rs (scalar FP), neon.rs + simd.rs (Advanced SIMD)
 src/gic.rs        ARM GICv2

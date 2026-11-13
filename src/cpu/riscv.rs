@@ -282,7 +282,10 @@ impl Riscv64 {
                 2 => if a[0] == 0 { (0, 0) } else { (INVALID_PARAM, 0) },             // hart_get_status: started
                 _ => (NOT_SUPPORTED, 0),
             },
-            0x5352_5354 if fid == 0 => return Err(Stop::Halt((a[1] != 0) as i32)), // system_reset
+            0x5352_5354 if fid == 0 => {
+                // system_reset: type 0 = shutdown, 1/2 = cold/warm reboot
+                return Err(if a[0] == 0 { Stop::Halt((a[1] != 0) as i32) } else { Stop::Reset });
+            }
             // PMU: just the fixed cycle (0) and instret (2) counters, no events. Linux's
             // driver needs this to grant user-mode `rdtime` (it then sets scounteren).
             0x50_4d55 => match fid {

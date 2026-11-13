@@ -4,6 +4,9 @@ use crate::bus::Device;
 use std::io::{Read, Write};
 use std::collections::VecDeque;
 use std::sync::mpsc::{Receiver, Sender};
+
+/// Console input shared by the UART and the machine (so it survives a reset).
+pub type SharedRx = Arc<Mutex<Receiver<u8>>>;
 use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -56,7 +59,7 @@ pub type SharedScript = Arc<Mutex<ConsoleScript>>;
 
 pub struct Uart {
     kind: UartKind,
-    rx: Option<Receiver<u8>>,
+    rx: Option<SharedRx>,
     script: SharedScript,
     pending: Option<u8>,
     // 16550 registers
@@ -74,7 +77,7 @@ pub struct Uart {
 impl Uart {
     /// `rx`: bytes the guest will receive (host stdin, scripted input, ...);
     /// `script`: expect-style input that waits for console output.
-    pub fn new(kind: UartKind, rx: Option<Receiver<u8>>, script: SharedScript) -> Self {
+    pub fn new(kind: UartKind, rx: Option<SharedRx>, script: SharedScript) -> Self {
         Uart { kind, rx, script, pending: None, ier: 0, lcr: 0, mcr: 0, scr: 0, fcr: 0, dll: 0, dlm: 0, thre: false }
     }
 
@@ -84,7 +87,7 @@ impl Uart {
         }
         if self.pending.is_none() {
             if let Some(rx) = &self.rx {
-                self.pending = rx.try_recv().ok();
+                self.pending = rx.lock().unwrap().try_recv().ok();
             }
         }
         self.pending.is_some()
@@ -199,7 +202,7 @@ impl Device for Uart {
 /// ARM PrimeCell PL011 UART with FIFOs modelled as unbounded queues and QEMU's
 /// interrupt behaviour (TX interrupt raised after each transmit, RX when data waits).
 pub struct Pl011 {
-    rx: Option<Receiver<u8>>,
+    rx: Option<SharedRx>,
     script: SharedScript,
     pending: Option<u8>,
     ibrd: u32,
@@ -217,7 +220,7 @@ const PL011_TX: u32 = 1 << 5;
 const PL011_RT: u32 = 1 << 6;
 
 impl Pl011 {
-    pub fn new(rx: Option<Receiver<u8>>, script: SharedScript) -> Self {
+    pub fn new(rx: Option<SharedRx>, script: SharedScript) -> Self {
         Pl011 { rx, script, pending: None, ibrd: 0, fbrd: 0, lcrh: 0, cr: 0x300, ifls: 0x12, imsc: 0, ris: PL011_TX }
     }
 
@@ -227,7 +230,7 @@ impl Pl011 {
         }
         if self.pending.is_none() {
             if let Some(rx) = &self.rx {
-                self.pending = rx.try_recv().ok();
+                self.pending = rx.lock().unwrap().try_recv().ok();
             }
         }
         self.pending.is_some()
@@ -302,6 +305,7 @@ impl Device for Pl011 {
 #[derive(Default)]
 pub struct TestFinisher {
     code: Option<i32>,
+    reset: bool,
 }
 
 impl Device for TestFinisher {
@@ -313,13 +317,102 @@ impl Device for TestFinisher {
             return;
         }
         match val & 0xffff {
-            0x5555 | 0x7777 => self.code = Some(0),
+            0x5555 => self.code = Some(0),
+            0x7777 => self.reset = true,
             0x3333 => self.code = Some((val >> 16) as i32),
             _ => {}
         }
     }
     fn halt_code(&self) -> Option<i32> {
         self.code
+    }
+    fn reset_request(&self) -> bool {
+        self.reset
+    }
+}
+
+/// Wall-clock source for the RTCs: host time, or a fixed start time for reproducible runs
+/// (then the clock advances with real time from that point).
+pub fn rtc_now_ns(fixed_epoch: Option<u64>, started: std::time::Instant) -> u64 {
+    match fixed_epoch {
+        Some(s) => s * 1_000_000_000 + started.elapsed().as_nanos() as u64,
+        None => std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos() as u64),
+    }
+}
+
+/// Goldfish RTC (RISC-V `virt`): 64-bit nanoseconds since the epoch; alarms are accepted
+/// but never fire.
+pub struct GoldfishRtc {
+    fixed: Option<u64>,
+    started: std::time::Instant,
+    high: u32,
+}
+
+impl GoldfishRtc {
+    pub fn new(fixed_epoch: Option<u64>) -> Self {
+        GoldfishRtc { fixed: fixed_epoch, started: std::time::Instant::now(), high: 0 }
+    }
+}
+
+impl Device for GoldfishRtc {
+    fn read(&mut self, off: u64, _size: usize) -> u64 {
+        match off {
+            0x00 => {
+                // reading TIME_LOW latches TIME_HIGH
+                let t = rtc_now_ns(self.fixed, self.started);
+                self.high = (t >> 32) as u32;
+                t & 0xffff_ffff
+            }
+            0x04 => self.high as u64,
+            _ => 0,
+        }
+    }
+    fn write(&mut self, _off: u64, _size: usize, _val: u64) {}
+}
+
+/// ARM PrimeCell PL031 RTC: seconds counter with a load register (no alarm interrupt).
+pub struct Pl031 {
+    fixed: Option<u64>,
+    started: std::time::Instant,
+    offset: i64,
+    mr: u32,
+    imsc: u32,
+}
+
+impl Pl031 {
+    pub fn new(fixed_epoch: Option<u64>) -> Self {
+        Pl031 { fixed: fixed_epoch, started: std::time::Instant::now(), offset: 0, mr: 0, imsc: 0 }
+    }
+    fn secs(&self) -> i64 {
+        (rtc_now_ns(self.fixed, self.started) / 1_000_000_000) as i64
+    }
+}
+
+impl Device for Pl031 {
+    fn read(&mut self, off: u64, _size: usize) -> u64 {
+        (match off {
+            0x00 => (self.secs() + self.offset) as u32,
+            0x04 => self.mr,
+            0x08 => (self.secs() + self.offset) as u32,
+            0x0c => 1,
+            0x10 => self.imsc,
+            0xfe0 => 0x31,
+            0xfe4 => 0x10,
+            0xfe8 => 0x04,
+            0xff0 => 0x0d,
+            0xff4 => 0xf0,
+            0xff8 => 0x05,
+            0xffc => 0xb1,
+            _ => 0,
+        }) as u64
+    }
+    fn write(&mut self, off: u64, _size: usize, val: u64) {
+        match off {
+            0x04 => self.mr = val as u32,
+            0x08 => self.offset = val as u32 as i64 - self.secs(),
+            0x10 => self.imsc = val as u32 & 1,
+            _ => {}
+        }
     }
 }
 

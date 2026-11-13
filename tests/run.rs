@@ -286,3 +286,50 @@ fn debian_linux_aarch64_boots_to_shell() {
         assert!(text.contains(want), "missing {want:?} in:\n{text}");
     }
 }
+
+/// Boot a Debian kernel with the small initramfs and an ext4 root on virtio-blk
+/// (tools/linux/mkroot.sh): the first boot counts itself on the disk and reboots, the
+/// second boot must see the persisted counter. Also checks RTC (fixed start time) and virtio-rng.
+fn linux_root_reboot(arch: &str, dir: &str, mem: &str, console: &str) {
+    let base = env!("CARGO_MANIFEST_DIR");
+    let root = format!("{base}/tests/guest/out/linux/root/{dir}");
+    let kernel = format!("{base}/tests/guest/out/linux/debian/{dir}/linux");
+    if !std::path::Path::new(&format!("{root}/root.ext4")).exists() || !std::path::Path::new(&kernel).exists() {
+        eprintln!("skipped: run tools/linux/fetch-debian.sh {dir} and tools/linux/mkroot.sh {dir} first");
+        return;
+    }
+    let tmp = std::env::temp_dir().join(format!("ruvm-root-{dir}-{}.ext4", std::process::id()));
+    std::fs::copy(format!("{root}/root.ext4"), &tmp).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_ruvm"))
+        .args(["-M", arch, "-m", mem, "-kernel", &kernel, "-initrd", &format!("{root}/initramfs.cpio.gz")])
+        .args(["-drive", &format!("file={}", tmp.display()), "-rng", "-rng-seed", "7", "-rtc", "1893456000"])
+        .args(["-append", &format!("console={console} rdinit=/init ruvm.test=reboot"), "-icount", "60000000000"])
+        .output()
+        .unwrap();
+    std::fs::remove_file(&tmp).ok();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "did not power off cleanly:\n{text}");
+    for want in [
+        "ruvm root: boot #1",
+        "first boot: rebooting",
+        "ruvm root: boot #2",
+        "second boot: /var/boots persisted = 2",
+        "year 2030",
+        "hwrng: 16 hex digits",
+        "reboot: Power down",
+    ] {
+        assert!(text.contains(want), "missing {want:?} in:\n{text}");
+    }
+}
+
+#[test]
+#[ignore]
+fn linux_ext4_root_reboot_riscv64() {
+    linux_root_reboot("riscv64", "riscv64", "256", "ttyS0");
+}
+
+#[test]
+#[ignore]
+fn linux_ext4_root_reboot_aarch64() {
+    linux_root_reboot("aarch64", "arm64", "512", "ttyAMA0");
+}

@@ -2,10 +2,16 @@
 
 use crate::bus::Bus;
 use crate::cpu::{aarch64::Aarch64, riscv::Riscv64, Cpu};
-use crate::devices::{forward_stdin, Clint, Pl011, SharedScript, TestFinisher, Uart, UartKind};
+use crate::devices::{
+    forward_stdin, Clint, GoldfishRtc, Pl011, Pl031, SharedRx, SharedScript, TestFinisher, Uart, UartKind,
+};
 use crate::fdt::Fdt;
+use crate::virtio::blk::{Disk, VirtioBlk};
+use crate::virtio::net::{NetSpec, VirtioNet};
+use crate::virtio::rng::VirtioRng;
+use crate::virtio::VirtioMmio;
 use std::sync::mpsc::{channel, Sender};
-use crate::virtio::VirtioBlk;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Stop {
@@ -15,6 +21,8 @@ pub enum Stop {
     Fatal(String),
     /// Instruction limit reached.
     Limit,
+    /// The guest asked for a reboot (the caller decides whether to call `Machine::reset`).
+    Reset,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,13 +60,44 @@ pub struct Machine {
     pub trace: bool,
     pub insns: u64,
     console_tx: Sender<u8>,
+    console_rx: SharedRx,
     script: SharedScript,
     ram_mb: usize,
-    has_disk: bool,
+    /// virtio devices in slot order; recreated on reset (disks keep their contents).
+    devices: Vec<DevSpec>,
+    /// How the guest was loaded, replayed on reset.
+    boot: Option<BootRecord>,
+    /// Fixed start time of the RTC (seconds since the epoch); `None` = host clock.
+    rtc_epoch: Option<u64>,
 }
 
+/// A virtio device attached to the board.
+#[derive(Clone)]
+pub enum DevSpec {
+    Blk(Disk),
+    Rng(Option<u64>),
+    Net(NetSpec),
+}
+
+#[derive(Clone)]
+enum BootRecord {
+    Image(Vec<u8>),
+    Raw(u64, Vec<u8>),
+    Linux(LinuxBoot),
+}
+
+/// MMIO window and interrupt of virtio slot `n` (QEMU `virt` layout).
+fn virtio_slot(arch: Arch, n: usize) -> (u64, u64, u32) {
+    match arch {
+        Arch::Riscv64 => (0x1000_1000 + 0x1000 * n as u64, 0x1000, 1 + n as u32),
+        Arch::Aarch64 => (0x0a00_0000 + 0x200 * n as u64, 0x200, 48 + n as u32),
+    }
+}
+
+pub const MAX_VIRTIO: usize = 8;
+
 /// What to boot with `Machine::boot_linux` (QEMU's -kernel/-initrd/-append/-bios).
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct LinuxBoot {
     /// Kernel `Image` (the arm64 / RISC-V boot-image format).
     pub kernel: Vec<u8>,
@@ -83,31 +122,83 @@ impl Machine {
     ///            0x1000_0000 NS16550 UART (PLIC irq 10), RAM @ 0x8000_0000
     ///   aarch64: 0x0900_0000 PL011 UART,                              RAM @ 0x4000_0000
     pub fn new(arch: Arch, ram_mb: usize, interactive: bool) -> Machine {
-        let mut bus = Bus::new(arch.ram_base(), ram_mb << 20);
-        bus.interactive = interactive;
         let (console_tx, console_rx) = channel();
         if interactive {
             forward_stdin(console_tx.clone());
         }
-        let rx = Some(console_rx);
-        let script = SharedScript::default();
+        let bus = Bus::new(arch.ram_base(), ram_mb << 20);
+        let mut m = Machine {
+            arch,
+            cpu: Box::new(Riscv64::new()),
+            bus,
+            trace: false,
+            insns: 0,
+            console_tx,
+            console_rx: Arc::new(Mutex::new(console_rx)),
+            script: SharedScript::default(),
+            ram_mb,
+            devices: Vec::new(),
+            boot: None,
+            rtc_epoch: None,
+        };
+        m.bus.interactive = interactive;
+        m.build_board();
+        m
+    }
+
+    /// (Re)create the CPU and the bus with all devices: power-on state.
+    fn build_board(&mut self) {
+        let arch = self.arch;
+        let interactive = self.bus.interactive;
+        let mut bus = Bus::new(arch.ram_base(), self.ram_mb << 20);
+        bus.interactive = interactive;
+        let (rx, script) = (Some(self.console_rx.clone()), self.script.clone());
         let cpu: Box<dyn Cpu> = match arch {
             Arch::Riscv64 => {
                 bus.map(0x10_0000, 0x1000, Box::new(TestFinisher::default()));
+                bus.map_irq(0x10_1000, 0x1000, 11, Box::new(GoldfishRtc::new(self.rtc_epoch)));
                 bus.map_clint(0x200_0000);
                 bus.map_plic(0xc00_0000);
-                bus.map_irq(0x1000_0000, 0x100, 10, Box::new(Uart::new(UartKind::Ns16550, rx, script.clone())));
+                bus.map_irq(0x1000_0000, 0x100, 10, Box::new(Uart::new(UartKind::Ns16550, rx, script)));
                 Box::new(Riscv64::new())
             }
             Arch::Aarch64 => {
                 bus.map_gic(0x0800_0000);
-                bus.map_irq(0x0900_0000, 0x1000, 33, Box::new(Pl011::new(rx, script.clone())));
+                bus.map_irq(0x0900_0000, 0x1000, 33, Box::new(Pl011::new(rx, script)));
+                bus.map_irq(0x0901_0000, 0x1000, 34, Box::new(Pl031::new(self.rtc_epoch)));
                 Box::new(Aarch64::new())
             }
         };
-        let mut m = Machine { arch, cpu, bus, trace: false, insns: 0, console_tx, script, ram_mb, has_disk: false };
-        m.cpu.set_pc(arch.ram_base());
-        m
+        for (n, spec) in self.devices.iter().enumerate() {
+            let (base, size, irq) = virtio_slot(arch, n);
+            let backend: Box<dyn crate::virtio::Backend> = match spec {
+                DevSpec::Blk(d) => Box::new(VirtioBlk::new(d.clone())),
+                DevSpec::Rng(seed) => Box::new(VirtioRng::new(*seed)),
+                DevSpec::Net(spec) => Box::new(VirtioNet::new(spec.clone())),
+            };
+            bus.map_irq(base, size, irq, Box::new(VirtioMmio::new(backend)));
+        }
+        self.bus = bus;
+        self.cpu = cpu;
+        self.cpu.set_pc(arch.ram_base());
+    }
+
+    /// Start the RTCs at this Unix time instead of following the host clock.
+    pub fn set_rtc_epoch(&mut self, epoch: Option<u64>) {
+        self.rtc_epoch = epoch;
+        self.build_board();
+    }
+
+    /// Reboot: power-cycle the board (RAM cleared, devices reset, disks keep their
+    /// contents) and boot the same images again.
+    pub fn reset(&mut self) -> Result<(), String> {
+        self.build_board();
+        match self.boot.clone() {
+            Some(BootRecord::Image(d)) => self.load_image(&d),
+            Some(BootRecord::Raw(a, d)) => self.load_raw(a, &d),
+            Some(BootRecord::Linux(b)) => self.boot_linux(&b).map(|_| ()),
+            None => Ok(()),
+        }
     }
 
     /// Queue bytes for the guest console (as if typed on the serial line).
@@ -123,29 +214,32 @@ impl Machine {
         self.script.lock().unwrap().push(wait_for, text);
     }
 
-    /// Attach a raw disk image as a virtio-mmio block device
-    /// (riscv64: 0x1000_1000, PLIC irq 1 — the first virtio slot of QEMU `virt`).
+    /// Attach a raw disk image as a virtio-mmio block device in the next free slot.
     /// With `snapshot`, guest writes stay in memory instead of going to the file.
     pub fn attach_disk(&mut self, path: &str, snapshot: bool) -> Result<(), String> {
-        let dev = if snapshot {
-            VirtioBlk::with_image(std::fs::read(path).map_err(|e| format!("{path}: {e}"))?, None)
-        } else {
-            VirtioBlk::open(path)?
-        };
-        self.attach_blk(dev)
+        let disk = if snapshot { Disk::read_file(path)? } else { Disk::open(path)? };
+        self.attach(DevSpec::Blk(disk))
     }
 
     /// Attach an in-memory disk image (writes are not persisted).
     pub fn attach_disk_image(&mut self, image: Vec<u8>) -> Result<(), String> {
-        self.attach_blk(VirtioBlk::with_image(image, None))
+        self.attach(DevSpec::Blk(Disk::from_image(image)))
     }
 
-    fn attach_blk(&mut self, dev: VirtioBlk) -> Result<(), String> {
-        self.has_disk = true;
-        match self.arch {
-            Arch::Riscv64 => self.bus.map_irq(0x1000_1000, 0x1000, 1, Box::new(dev)),
-            Arch::Aarch64 => self.bus.map_irq(0x0a00_0000, 0x200, 48, Box::new(dev)),
+    /// Attach a virtio device in the next free slot.
+    pub fn attach(&mut self, spec: DevSpec) -> Result<(), String> {
+        if self.devices.len() >= MAX_VIRTIO {
+            return Err("too many virtio devices".into());
         }
+        self.devices.push(spec);
+        let n = self.devices.len() - 1;
+        let (base, size, irq) = virtio_slot(self.arch, n);
+        let backend: Box<dyn crate::virtio::Backend> = match &self.devices[n] {
+            DevSpec::Blk(d) => Box::new(VirtioBlk::new(d.clone())),
+            DevSpec::Rng(seed) => Box::new(VirtioRng::new(*seed)),
+            DevSpec::Net(spec) => Box::new(VirtioNet::new(spec.clone())),
+        };
+        self.bus.map_irq(base, size, irq, Box::new(VirtioMmio::new(backend)));
         Ok(())
     }
 
@@ -220,14 +314,21 @@ impl Machine {
                 t.u32("interrupt-parent", 2);
                 t.u32("interrupts", 10);
                 t.end();
-                if self.has_disk {
-                    t.begin("virtio_mmio@10001000");
+                for n in 0..self.devices.len() {
+                    let (base, size, irq) = virtio_slot(self.arch, n);
+                    t.begin(&format!("virtio_mmio@{base:x}"));
                     t.str("compatible", "virtio,mmio");
-                    t.u64s("reg", &[0x1000_1000, 0x1000]);
+                    t.u64s("reg", &[base, size]);
                     t.u32("interrupt-parent", 2);
-                    t.u32("interrupts", 1);
+                    t.u32("interrupts", irq);
                     t.end();
                 }
+                t.begin("rtc@101000");
+                t.str("compatible", "google,goldfish-rtc");
+                t.u64s("reg", &[0x10_1000, 0x1000]);
+                t.u32("interrupt-parent", 2);
+                t.u32("interrupts", 11);
+                t.end();
                 t.begin("test@100000");
                 t.strs("compatible", &["sifive,test1", "sifive,test0", "syscon"]);
                 t.u64s("reg", &[0x10_0000, 0x1000]);
@@ -303,14 +404,22 @@ impl Machine {
                 t.u32s("clocks", &[2, 2]);
                 t.strs("clock-names", &["uartclk", "apb_pclk"]);
                 t.end();
-                if self.has_disk {
-                    t.begin("virtio_mmio@a000000");
+                for n in 0..self.devices.len() {
+                    let (base, size, irq) = virtio_slot(self.arch, n);
+                    t.begin(&format!("virtio_mmio@{base:x}"));
                     t.str("compatible", "virtio,mmio");
-                    t.u64s("reg", &[0x0a00_0000, 0x200]);
-                    t.u32s("interrupts", &[0, 16, 1]);
+                    t.u64s("reg", &[base, size]);
+                    t.u32s("interrupts", &[0, irq - 32, 1]);
                     t.empty("dma-coherent");
                     t.end();
                 }
+                t.begin("pl031@9010000");
+                t.strs("compatible", &["arm,pl031", "arm,primecell"]);
+                t.u64s("reg", &[0x0901_0000, 0x1000]);
+                t.u32s("interrupts", &[0, 2, 4]);
+                t.u32("clocks", 2);
+                t.str("clock-names", "apb_pclk");
+                t.end();
             }
         }
         t.end();
@@ -390,6 +499,7 @@ impl Machine {
                 cpu.set_reg(0, dtb_addr);
             }
         }
+        self.boot = Some(BootRecord::Linux(b.clone()));
         Ok(dtb)
     }
 
@@ -397,6 +507,7 @@ impl Machine {
     pub fn load_raw(&mut self, addr: u64, data: &[u8]) -> Result<(), String> {
         self.bus.load(addr, data)?;
         self.cpu.set_pc(addr);
+        self.boot = Some(BootRecord::Raw(addr, data.to_vec()));
         Ok(())
     }
 
@@ -405,6 +516,7 @@ impl Machine {
         if data.starts_with(b"\x7fELF") {
             let entry = self.load_elf(data)?;
             self.cpu.set_pc(entry);
+            self.boot = Some(BootRecord::Image(data.to_vec()));
             Ok(())
         } else {
             self.load_raw(self.arch.ram_base(), data)
@@ -459,7 +571,10 @@ impl Machine {
             if let Some(s) = stop {
                 return s;
             }
-            self.bus.poll_irqs(); // pick up console input
+            if self.bus.reset {
+                return Stop::Reset;
+            }
+            self.bus.poll_irqs(); // pick up console input and asynchronous device work
         }
     }
 }
