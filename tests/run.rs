@@ -421,3 +421,81 @@ fn linux_user_network_riscv64() {
 fn linux_user_network_aarch64() {
     linux_network("aarch64", "arm64", "512", "ttyAMA0");
 }
+
+fn run_elf_smp(arch: &str, name: &str, cpus: &str) -> String {
+    let path = format!("{}/tests/guest/prebuilt/{}", env!("CARGO_MANIFEST_DIR"), name);
+    let out = Command::new(env!("CARGO_BIN_EXE_ruvm"))
+        .args(["-M", arch, "-smp", cpus, "-kernel", &path, "-icount", "2000000000"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{name}: {}", String::from_utf8_lossy(&out.stderr));
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// Four harts running the same program (as with QEMU `-bios none -smp 4`): AMO counter,
+/// LR/SC spinlock and CLINT software interrupts; output equal to qemu-system-riscv64.
+#[test]
+fn riscv_smp_matches_qemu_system() {
+    assert_eq!(run_elf_smp("riscv64", "rv_smp.elf", "4"), expected("rv_smp.expected"));
+}
+
+/// PSCI CPU_ON / error codes, LDXR/STXR and LSE atomics across CPUs, GIC SGIs with source
+/// ids and target filters, broadcast TLBI; output equal to qemu-system-aarch64 -smp 4.
+#[test]
+fn aarch64_smp_matches_qemu_system() {
+    assert_eq!(run_elf_smp("aarch64", "a64_smp.elf", "4"), expected("a64_smp.expected"));
+}
+
+/// xv6 (its own SMP scheduler and spinlocks) on two harts: both start and the shell works.
+#[test]
+fn xv6_boots_on_two_harts() {
+    let dir = format!("{}/tests/guest/prebuilt/xv6", env!("CARGO_MANIFEST_DIR"));
+    let out = Command::new(env!("CARGO_BIN_EXE_ruvm"))
+        .args(["-M", "riscv64", "-smp", "2", "-m", "128", "-kernel", &format!("{dir}/kernel")])
+        .args(["-drive", &format!("file={dir}/fs.img"), "-snapshot"])
+        .args(["-send-after", "$ ", "echo smp-ok\\n", "-icount", "2500000000"])
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    for want in ["hart 1 starting", "smp-ok"] {
+        assert!(text.contains(want), "missing {want:?} in:\n{text}");
+    }
+}
+
+fn linux_smp(arch: &str, dir: &str, console: &str) {
+    let base = env!("CARGO_MANIFEST_DIR");
+    let root = format!("{base}/tests/guest/out/linux/root/{dir}");
+    let kernel = format!("{base}/tests/guest/out/linux/debian/{dir}/linux");
+    if !std::path::Path::new(&format!("{root}/initramfs.cpio.gz")).exists() || !std::path::Path::new(&kernel).exists() {
+        eprintln!("skipped: run tools/linux/fetch-debian.sh {dir} and tools/linux/mkroot.sh {dir} first");
+        return;
+    }
+    let tmp = std::env::temp_dir().join(format!("ruvm-smp-{dir}-{}.ext4", std::process::id()));
+    std::fs::copy(format!("{root}/root.ext4"), &tmp).unwrap();
+    let script = "echo NPROC=$(nproc); for i in 1 2 3 4; do (n=0; while [ $n -lt 2000 ]; do n=$((n+1)); done; echo job$i-done) & done; wait; echo ALLDONE\\n";
+    let out = Command::new(env!("CARGO_BIN_EXE_ruvm"))
+        .args(["-M", arch, "-m", "512", "-smp", "4", "-kernel", &kernel, "-initrd", &format!("{root}/initramfs.cpio.gz")])
+        .args(["-drive", &format!("file={}", tmp.display()), "-append", &format!("console={console} rdinit=/init")])
+        .args(["-send-after", "# ", script, "-send-after", "ALLDONE", "\\npoweroff -f\\n", "-icount", "100000000000"])
+        .output()
+        .unwrap();
+    std::fs::remove_file(&tmp).ok();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "did not power off cleanly:\n{text}");
+    for want in ["smp: Brought up 1 node, 4 CPUs", "NPROC=4", "job1-done", "job4-done", "reboot: Power down"] {
+        assert!(text.contains(want), "missing {want:?} in:\n{text}");
+    }
+    assert!(!text.contains("soft lockup") && !text.contains("rcu: INFO"), "stall detected:\n{text}");
+}
+
+#[test]
+#[ignore]
+fn linux_smp_riscv64() {
+    linux_smp("riscv64", "riscv64", "ttyS0");
+}
+
+#[test]
+#[ignore]
+fn linux_smp_aarch64() {
+    linux_smp("aarch64", "arm64", "ttyAMA0");
+}

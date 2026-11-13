@@ -1,0 +1,11 @@
+RISC-V SMP test
+AMO counter      = 0x0000000000000fa0
+locked counter   = 0x0000000000000640
+hart seen        = 0x0000000000000064
+hart seen        = 0x0000000000000065
+hart seen        = 0x0000000000000066
+hart seen        = 0x0000000000000067
+ipi acknowledged = 0x000000000000000b
+ipi acknowledged = 0x000000000000000b
+ipi acknowledged = 0x000000000000000b
+done

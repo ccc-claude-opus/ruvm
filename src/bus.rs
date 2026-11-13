@@ -84,6 +84,22 @@ struct Mapping {
     dev: Box<dyn Device>,
 }
 
+/// Cross-CPU requests and state for one CPU (hart / core), kept on the bus so that one CPU
+/// can start, interrupt or flush another without owning it.
+#[derive(Clone, Default)]
+pub struct CpuCtl {
+    /// The CPU is powered off / stopped (waiting for `start`).
+    pub parked: bool,
+    /// Start request: (entry pc, argument).
+    pub start: Option<(u64, u64)>,
+    /// Another CPU asked for a TLB flush (remote `sfence.vma`, broadcast TLBI).
+    pub flush_tlb: bool,
+    /// Pending supervisor software interrupt (SBI IPI).
+    pub ssip: bool,
+    /// The CPU executed WFI and sleeps until an interrupt is pending.
+    pub waiting: bool,
+}
+
 pub struct Bus {
     ram_base: u64,
     ram: Vec<u8>,
@@ -92,6 +108,11 @@ pub struct Bus {
     /// (one tick per executed instruction) and is also used for the ARM generic timer.
     pub clint: Clint,
     clint_base: Option<u64>,
+    /// Number of CPUs, the CPU whose instruction is executing (selects banked GIC state),
+    /// and per-CPU cross-CPU control state.
+    pub ncpus: usize,
+    pub cur_cpu: usize,
+    pub ctl: Vec<CpuCtl>,
     pub plic: Plic,
     plic_base: Option<u64>,
     /// ARM GICv2 (distributor at `gic_base`, CPU interface at `gic_base + 0x10000`).
@@ -115,15 +136,22 @@ const PLIC_SIZE: u64 = 0x400_0000;
 
 impl Bus {
     pub fn new(ram_base: u64, ram_size: usize) -> Self {
+        Self::with_cpus(ram_base, ram_size, 1)
+    }
+
+    pub fn with_cpus(ram_base: u64, ram_size: usize, ncpus: usize) -> Self {
         Bus {
             ram_base,
             ram: vec![0; ram_size],
             devs: Vec::new(),
-            clint: Clint::default(),
+            clint: Clint::new(ncpus),
             clint_base: None,
-            plic: Plic::default(),
+            ncpus,
+            cur_cpu: 0,
+            ctl: vec![CpuCtl::default(); ncpus],
+            plic: Plic::new(ncpus),
             plic_base: None,
-            gic: Gic::default(),
+            gic: Gic::new(ncpus),
             gic_base: None,
             halt: None,
             reset: false,
@@ -131,6 +159,14 @@ impl Bus {
             interactive: false,
             realtime_idle: false,
         }
+    }
+
+    /// Board-clock ticks that `n` instructions of one CPU are worth: with several CPUs
+    /// taking turns, each CPU's instructions count for `1/ncpus` tick so that simulated
+    /// time per instruction does not depend on the CPU count.
+    #[inline(always)]
+    pub fn ticks(&self, n: u64) -> u64 {
+        if self.ncpus == 1 { n } else { n.div_ceil(self.ncpus as u64) }
     }
 
     pub fn ram_base(&self) -> u64 {
@@ -230,7 +266,7 @@ impl Bus {
             return Ok(v);
         }
         if let Some(b) = self.gic_base.filter(|&b| addr >= b && addr < b + 0x2_0000) {
-            let v = self.gic.read(addr - b, size);
+            let v = self.gic.read(self.cur_cpu, addr - b, size);
             return Ok(v);
         }
         let k = self.devs.iter().position(|m| addr >= m.base && addr < m.base + m.size).ok_or(BusError(addr))?;
@@ -254,7 +290,7 @@ impl Bus {
             return Ok(());
         }
         if let Some(b) = self.gic_base.filter(|&b| addr >= b && addr < b + 0x2_0000) {
-            self.gic.write(addr - b, size, val);
+            self.gic.write(self.cur_cpu, addr - b, size, val);
             return Ok(());
         }
         let k = self.devs.iter().position(|m| addr >= m.base && addr < m.base + m.size).ok_or(BusError(addr))?;
@@ -298,7 +334,7 @@ impl Bus {
     /// attached, time advances in small real-time steps so typing is noticed.
     pub fn idle(&mut self, deadline: u64) {
         let c = &mut self.clint;
-        let next = c.mtimecmp.min(deadline);
+        let next = c.next_deadline().min(deadline);
         if self.interactive || self.realtime_idle {
             std::thread::sleep(std::time::Duration::from_micros(500));
             c.mtime += 5_000;

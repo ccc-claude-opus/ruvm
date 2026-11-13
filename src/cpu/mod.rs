@@ -17,6 +17,10 @@ pub trait Cpu: std::any::Any {
     fn step(&mut self, bus: &mut Bus) -> Result<(), Stop>;
     /// Human-readable register dump.
     fn dump(&self) -> String;
+    /// When an idle (WFI) CPU would wake up by itself: its next timer deadline (board time).
+    fn wake_deadline(&self, _bus: &Bus) -> u64 {
+        u64::MAX
+    }
     /// Execute up to `n` instructions, advancing the board clock one tick per
     /// instruction. Returns how many ran and why it stopped early, if it did.
     fn run(&mut self, bus: &mut Bus, n: u64) -> (u64, Option<Stop>) {

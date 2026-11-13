@@ -5,7 +5,7 @@ use ruvm::{demo, is_linux_image, Arch, LinuxBoot, Machine, Stop};
 use std::process::exit;
 
 const USAGE: &str = "\
-ruvm 0.9 — a tiny QEMU-like emulator (RISC-V 64 / AArch64)
+ruvm 0.10 — a tiny QEMU-like emulator (RISC-V 64 / AArch64)
 
 USAGE:
     ruvm -M <riscv64|aarch64> (-kernel <file> | -demo hello) [options]
@@ -27,6 +27,7 @@ OPTIONS:
     -rtc <secs>                   start the RTC at this Unix time (default: host clock)
     -nic user[,hostfwd=tcp::H-:G] virtio-net with a user-mode network (guest 10.0.2.15, gateway/host 10.0.2.2, DNS 10.0.2.3)
     -no-reboot                    exit instead of rebooting when the guest resets
+    -smp <n>                      number of CPUs (1-8, scheduled round-robin; default 1)
     -input <text>                 type <text> on the guest console at start (\\n = newline)
     -send-after <pattern> <text>  type <text> once the console has printed <pattern> (repeatable)
     -icount <N>                   stop after N instructions
@@ -57,6 +58,7 @@ fn main() {
     let mut drives: Vec<String> = Vec::new();
     let (mut rng, mut rng_seed, mut rtc, mut no_reboot) = (false, None, None, false);
     let mut nic: Option<(Vec<HostFwd>, [u8; 6])> = None;
+    let mut smp = 1usize;
     let (mut snapshot, mut input) = (false, String::new());
     let mut expects: Vec<(String, String)> = Vec::new();
     let (mut initrd, mut append, mut bios, mut dumpdtb) = (None, String::new(), None, None);
@@ -89,6 +91,14 @@ fn main() {
             }
             "-rtc" => rtc = Some(val("-rtc").parse().unwrap_or_else(|_| die("-rtc expects seconds since the epoch"))),
             "-no-reboot" => no_reboot = true,
+            "-smp" => {
+                // -smp N (QEMU also accepts cpus=N,... : only the count is used)
+                let v = val("-smp");
+                smp = v.split(',').next().unwrap_or("1").trim_start_matches("cpus=").parse().unwrap_or_else(|_| die("-smp expects a CPU count"));
+                if !(1..=8).contains(&smp) {
+                    die("-smp supports 1 to 8 CPUs");
+                }
+            }
             "-nic" | "-netdev" | "-net" => {
                 // user[,hostfwd=tcp::HOST-:GUEST][,mac=52:54:00:12:34:56]
                 let v = val("-nic");
@@ -138,7 +148,7 @@ fn main() {
     }
 
     let arch = arch.unwrap_or_else(|| die("missing -M <riscv64|aarch64>"));
-    let mut vm = Machine::new(arch, ram, interactive);
+    let mut vm = Machine::with_cpus(arch, ram, interactive, smp);
     vm.set_rtc_epoch(rtc);
     vm.trace = trace;
     vm.send_input(input.as_bytes());
@@ -206,7 +216,7 @@ fn main() {
         stop = vm.run(icount);
     }
     if regs || matches!(stop, Stop::Fatal(_)) {
-        eprintln!("--- {} registers ---\n{}", vm.cpu.name(), vm.cpu.dump());
+        eprintln!("--- {} registers ---\n{}", vm.cpu().name(), vm.cpu().dump());
     }
     match stop {
         Stop::Halt(code) => exit(code),

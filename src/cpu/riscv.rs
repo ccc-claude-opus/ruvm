@@ -174,6 +174,8 @@ pub struct Riscv64 {
     /// Built-in SBI firmware: `ecall` from S-mode is served by the emulator
     /// (set by `boot_supervisor`; with `-bios <file>` the real firmware does it).
     sbi: bool,
+    /// Hart id (mhartid) and the number of harts on the board.
+    id: usize,
     /// All 65536 compressed encodings expanded to 32-bit instructions (0 = illegal).
     rvc_table: Box<[u32]>,
     /// Interrupt-relevant state changed: end the current batch so `pre` runs again.
@@ -188,15 +190,39 @@ fn sx32(v: u32) -> u64 {
 impl Riscv64 {
     /// Sample time and interrupt lines and take a pending interrupt, between instructions.
     #[inline(always)]
-    fn pre(&mut self, bus: &mut Bus) -> Result<(), Stop> {
+    fn sample_lines(&mut self, bus: &mut Bus) {
+        let id = self.id;
         self.time = bus.clint.mtime;
-        self.hw_ip = (bus.clint.mtip() as u64) << 7
-            | (bus.clint.msip as u64) << 3
-            | (bus.plic.out[0] as u64) << 11
-            | (bus.plic.out[1] as u64) << 9;
+        if std::mem::take(&mut bus.ctl[id].ssip) {
+            self.csr[MIP] |= SSI; // SBI IPI from another hart
+        }
+        self.hw_ip = (bus.clint.mtip(id) as u64) << 7
+            | (bus.clint.msip[id] as u64) << 3
+            | (bus.plic.out[2 * id] as u64) << 11
+            | (bus.plic.out[2 * id + 1] as u64) << 9;
         if self.csr[MENVCFG] >> 63 == 1 && self.time >= self.csr[STIMECMP] {
             self.hw_ip |= STI; // Sstc
         }
+    }
+
+    /// Requests from other harts: TLB flush, start (SBI HSM).
+    fn service_ctl(&mut self, bus: &mut Bus) {
+        let id = self.id;
+        if std::mem::take(&mut bus.ctl[id].flush_tlb) {
+            self.flush_tlb();
+        }
+        if let Some((pc, arg)) = bus.ctl[id].start.take() {
+            // a (re)started hart begins in S-mode with a clean state
+            *self = Riscv64::new(id);
+            self.boot_supervisor(pc, arg);
+            bus.ctl[id].parked = false;
+            bus.ctl[id].waiting = false;
+        }
+    }
+
+    #[inline(always)]
+    fn pre(&mut self, bus: &mut Bus) -> Result<(), Stop> {
+        self.sample_lines(bus);
         if let Some(code) = self.pending_interrupt() {
             self.take_trap(INTERRUPT | code, 0)?;
         }
@@ -218,7 +244,7 @@ impl Riscv64 {
         }
     }
 
-    pub fn new() -> Self {
+    pub fn new(id: usize) -> Self {
         let mut csr = vec![0u64; 4096];
         // RV64 (MXL=2), extensions A C D F I M S U
         csr[MISA] = (2u64 << 62) | 1 | (1 << 2) | (1 << 3) | (1 << 5) | (1 << 8) | (1 << 12) | (1 << 18) | (1 << 20);
@@ -240,6 +266,7 @@ impl Riscv64 {
             fetch_vpn: 0,
             fetch_off: 0,
             sbi: false,
+            id,
             recheck: false,
             rvc_table: (0..=u16::MAX).map(|c| rvc::expand(c).unwrap_or(0)).collect(),
         }
@@ -260,7 +287,7 @@ impl Riscv64 {
         self.sbi = true;
         self.prv = PRV_S;
         self.pc = entry;
-        self.x[10] = 0;
+        self.x[10] = self.id as u64;
         self.x[11] = dtb;
         // what OpenSBI would leave behind: delegate everything S-mode can handle
         self.csr[MEDELEG] = 0xb1ff | 1 << 12 | 1 << 13 | 1 << 15;
@@ -305,19 +332,59 @@ impl Riscv64 {
                 3 => (0, (EXTS.contains(&a[0]) || a[0] <= 8) as u64),
                 _ => (0, 0),                // mvendorid / marchid / mimpid
             },
-            0x73_5049 => {
-                if a[1] == u64::MAX || (a[1] == 0 && a[0] & 1 == 1) {
-                    self.csr[MIP] |= SSI;
+            0x73_5049 | 0x5246_4e43 => {
+                // IPI send_ipi / RFENCE remote_*: (hart_mask, hart_mask_base) select the target harts
+                let (mask, base) = (a[0], a[1]);
+                let n = bus.ncpus;
+                for h in 0..n {
+                    let hit = base == u64::MAX || (h as u64 >= base && h as u64 - base < 64 && mask >> (h as u64 - base) & 1 == 1);
+                    if !hit {
+                        continue;
+                    }
+                    if eid == 0x73_5049 {
+                        if h == self.id { self.csr[MIP] |= SSI } else { bus.ctl[h].ssip = true }
+                    } else if h == self.id {
+                        self.flush_tlb();
+                    } else {
+                        bus.ctl[h].flush_tlb = true;
+                    }
                 }
                 (0, 0)
             }
-            0x5246_4e43 => {
-                self.flush_tlb();
-                (0, 0)
-            }
             0x48_534d => match fid {
-                0 => (if a[0] == 0 { ALREADY_AVAILABLE } else { INVALID_PARAM }, 0), // hart_start
-                2 => if a[0] == 0 { (0, 0) } else { (INVALID_PARAM, 0) },             // hart_get_status: started
+                0 => {
+                    // hart_start(hartid, start_addr, opaque)
+                    let h = a[0] as usize;
+                    if a[0] >= bus.ncpus as u64 {
+                        (INVALID_PARAM, 0)
+                    } else if !bus.ctl[h].parked || bus.ctl[h].start.is_some() {
+                        (ALREADY_AVAILABLE, 0)
+                    } else {
+                        bus.ctl[h].start = Some((a[1], a[2]));
+                        (0, 0)
+                    }
+                }
+                1 => {
+                    // hart_stop: this hart stops (it never returns from the call)
+                    bus.ctl[self.id].parked = true;
+                    self.recheck = true;
+                    (0, 0)
+                }
+                2 => {
+                    // hart_get_status: STARTED 0, STOPPED 1, START_PENDING 2
+                    if a[0] >= bus.ncpus as u64 {
+                        (INVALID_PARAM, 0)
+                    } else {
+                        let c = &bus.ctl[a[0] as usize];
+                        (0, if c.start.is_some() { 2 } else if c.parked { 1 } else { 0 })
+                    }
+                }
+                3 if a[0] as u32 == 0 => {
+                    // hart_suspend, default retentive: sleep until an interrupt, then resume here
+                    bus.ctl[self.id].waiting = true;
+                    self.recheck = true;
+                    (0, 0)
+                }
                 _ => (NOT_SUPPORTED, 0),
             },
             0x5352_5354 if fid == 0 => {
@@ -400,7 +467,8 @@ impl Riscv64 {
             0xb00 | 0xb02 | 0xc00 | 0xc02 => self.insns, // mcycle minstret cycle instret
             0xc01 => self.time,
             0xb03..=0xb1f | 0xc03..=0xc1f | 0x323..=0x33f => 0, // hpm counters / events
-            0xf11..=0xf15 => 0, // mvendorid marchid mimpid mhartid mconfigptr
+            0xf14 => self.id as u64, // mhartid
+            0xf11..=0xf15 => 0,      // mvendorid marchid mimpid mconfigptr
             _ => return None,
         })
     }
@@ -911,8 +979,9 @@ impl Riscv64 {
                             return Err(illegal);
                         }
                         if self.mip() & self.csr[MIE] == 0 {
-                            let sstc = self.csr[MENVCFG] >> 63 == 1 && self.csr[MIE] & STI != 0;
-                            bus.idle(if sstc { self.csr[STIMECMP] } else { u64::MAX });
+                            // sleep until an interrupt is pending (the scheduler skips this hart)
+                            bus.ctl[self.id].waiting = true;
+                            self.recheck = true;
                         }
                     }
                     (0x09, _, 0) => {
@@ -1124,7 +1193,7 @@ impl Riscv64 {
 
 impl Default for Riscv64 {
     fn default() -> Self {
-        Self::new()
+        Self::new(0)
     }
 }
 
@@ -1153,12 +1222,32 @@ impl Cpu for Riscv64 {
 
     /// Batched execution: board time, interrupt lines and the halt flag are examined once
     /// per batch of up to `BATCH` instructions (interrupts are taken at batch boundaries).
+    fn wake_deadline(&self, bus: &Bus) -> u64 {
+        let mut d = bus.clint.mtimecmp[self.id];
+        if self.csr[MENVCFG] >> 63 == 1 {
+            d = d.min(self.csr[STIMECMP]);
+        }
+        d
+    }
+
     fn run(&mut self, bus: &mut Bus, n: u64) -> (u64, Option<Stop>) {
         const BATCH: u64 = 32;
+        bus.cur_cpu = self.id;
+        self.service_ctl(bus);
+        if bus.ctl[self.id].parked {
+            return (0, None);
+        }
+        if bus.ctl[self.id].waiting {
+            self.sample_lines(bus);
+            if self.mip() & self.csr[MIE] == 0 {
+                return (0, None); // still asleep
+            }
+            bus.ctl[self.id].waiting = false;
+        }
         let mut done = 0;
         while done < n {
             let k = (n - done).min(BATCH);
-            bus.clint.mtime += k;
+            bus.clint.mtime += bus.ticks(k);
             self.insns += k;
             if let Err(s) = self.pre(bus) {
                 return (done + 1, Some(s));
@@ -1178,17 +1267,28 @@ impl Cpu for Riscv64 {
             self.recheck = false;
             bus.irq_dirty = false;
             // give back the unused part of the batch (board time and instret stay exact)
-            bus.clint.mtime -= k - j;
+            bus.clint.mtime -= bus.ticks(k) - bus.ticks(j);
             self.insns -= k - j;
             done += j;
             if let Some(code) = bus.halt {
                 return (done, Some(Stop::Halt(code)));
             }
-            if bus.reset {
+            if bus.reset || bus.ctl[self.id].waiting || bus.ctl[self.id].parked {
                 break;
             }
         }
-        (done, None)
+        // never hand the board to another hart in the middle of an LR/SC sequence
+        let mut extra = 0;
+        while self.resv.is_some() && extra < 64 {
+            extra += 1;
+            self.insns += 1;
+            if let Err(e) = self.exec(bus) {
+                if let Err(s) = self.handle_ex(bus, e) {
+                    return (done + extra, Some(s));
+                }
+            }
+        }
+        (done + extra, None)
     }
 
     fn dump(&self) -> String {

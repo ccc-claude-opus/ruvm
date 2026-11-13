@@ -28,8 +28,11 @@ $A64F -T out/a64.ld -o out/a64_fp.elf a64_fp_start.S a64_fp.c
 $A64F -T out/a64.ld -o out/a64_neon.elf a64_fp_start.S a64_neon.c
 $A64 -T out/a64.ld -o out/a64_mmu.elf a64_priv_start.S a64_mmu.c
 $A64 -T out/a64.ld -o out/a64_irq.elf a64_priv_start.S a64_irq.c
+# SMP guests (4 CPUs)
+$RV -T out/rv.ld -o out/rv_smp.elf rv_smp_start.S rv_smp.c
+$A64 -T out/a64.ld -o out/a64_smp.elf a64_priv_start.S a64_smp_sec.S a64_smp.c
 cp out/rv_priv.elf out/selftest_rvc.elf out/a64_priv.elf out/rv_fp.elf out/rv_sbi.Image prebuilt/
-cp out/a64_fp.elf out/a64_neon.elf out/a64_mmu.elf out/a64_irq.elf prebuilt/
+cp out/a64_fp.elf out/a64_neon.elf out/a64_mmu.elf out/a64_irq.elf out/rv_smp.elf out/a64_smp.elf prebuilt/
 OPENSBI=$(dirname "$(command -v qemu-system-riscv64)")/../share/qemu/opensbi-riscv64-generic-fw_dynamic.bin
 [ -f "$OPENSBI" ] && cp "$OPENSBI" prebuilt/opensbi-fw_dynamic.bin
 
@@ -37,6 +40,8 @@ if command -v qemu-system-riscv64 >/dev/null && command -v qemu-system-aarch64 >
     timeout 20 qemu-system-riscv64 -M virt -bios none -nographic -kernel out/rv_priv.elf > prebuilt/rv_priv.expected
     timeout 20 qemu-system-aarch64 -M virt -cpu max -nographic -kernel out/a64_priv.elf > prebuilt/a64_priv.expected
     timeout 60 qemu-system-riscv64 -M virt -bios none -nographic -kernel out/rv_fp.elf > prebuilt/rv_fp.expected
+    timeout 60 qemu-system-riscv64 -M virt -bios none -smp 4 -nographic -kernel out/rv_smp.elf > prebuilt/rv_smp.expected
+    timeout 60 qemu-system-aarch64 -M virt -cpu max -smp 4 -nographic -kernel out/a64_smp.elf > prebuilt/a64_smp.expected
     for t in a64_fp a64_neon a64_mmu a64_irq; do
         timeout 120 qemu-system-aarch64 -M virt -cpu max -nographic -kernel out/$t.elf > prebuilt/$t.expected
     done

@@ -157,6 +157,8 @@ pub struct Aarch64 {
     /// Debug aid (env RUVM_LOG_UNDEF): log every undefined-instruction exception.
     log_undef: bool,
     last_insn: u32,
+    /// CPU number (MPIDR Aff0).
+    id: usize,
     /// Interrupt-relevant state changed: end the current batch so `pre` runs again.
     recheck: bool,
     bitmask_cache: Vec<(u32, Option<(u64, u64)>)>,
@@ -262,13 +264,29 @@ fn awc(a: u64, b: u64, cin: bool, sf: bool) -> (u64, (bool, bool, bool, bool)) {
 }
 
 impl Aarch64 {
+    /// Requests from other CPUs: TLB flush, power-on (PSCI CPU_ON).
+    fn service_ctl(&mut self, bus: &mut Bus) {
+        let id = self.id;
+        if std::mem::take(&mut bus.ctl[id].flush_tlb) {
+            self.flush_tlb();
+        }
+        if let Some((pc, ctx)) = bus.ctl[id].start.take() {
+            // power-on reset state: EL1h, MMU off, interrupts masked, x0 = context id
+            *self = Aarch64::new(id);
+            self.pc = pc;
+            self.x[0] = ctx;
+            bus.ctl[id].parked = false;
+            bus.ctl[id].waiting = false;
+        }
+    }
+
     /// Timers and interrupts, checked between instructions. Returns true if an IRQ was taken.
     #[inline(always)]
     fn pre(&mut self, bus: &mut Bus) -> bool {
         if bus.clint.mtime >= self.timer_deadline {
             self.update_timers(bus);
         }
-        if bus.gic.irq_line && self.daif & 2 == 0 && self.sysreg(SYS_VBAR_EL1) != 0 {
+        if bus.gic.irq_line[self.id] && self.daif & 2 == 0 && self.sysreg(SYS_VBAR_EL1) != 0 {
             self.irq_exception();
             return true;
         }
@@ -303,7 +321,7 @@ impl Aarch64 {
         }
     }
 
-    pub fn new() -> Self {
+    pub fn new(id: usize) -> Self {
         Aarch64 {
             x: [0; 31],
             sp: 0,
@@ -337,6 +355,7 @@ impl Aarch64 {
             vr: [0; 32],
             log_undef: std::env::var_os("RUVM_LOG_UNDEF").is_some(),
             last_insn: 0,
+            id,
             recheck: false,
             bitmask_cache: vec![(0, None); 256],
         }
@@ -410,7 +429,7 @@ impl Aarch64 {
             let enabled = ctl & 1 == 1;
             let met = now >= cval;
             let line = enabled && ctl & 2 == 0 && met;
-            bus.gic.set_level(ppi, line);
+            bus.gic.set_ppi(self.id, ppi, line);
             if enabled && !met {
                 deadline = deadline.min(cval);
             }
@@ -435,7 +454,7 @@ impl Aarch64 {
             SYS_SPSEL => self.spsel as u64,
             SYS_SP_EL0 => self.sp_el0(),
             SYS_MIDR_EL1 => 0x411f_d073, // Cortex-A57 r1p3
-            SYS_MPIDR_EL1 => 0x8000_0000,
+            SYS_MPIDR_EL1 => 0x8000_0000 | self.id as u64,
             SYS_REVIDR_EL1 => 0,
             SYS_CTR_EL0 => 0x8444_c004,
             SYS_DCZID_EL0 => 4, // DC ZVA allowed, 64-byte blocks
@@ -518,7 +537,13 @@ impl Aarch64 {
             }
             (_, 8, _, _) | (_, 7, 5, _) | (_, 7, 1, _) => {
                 if crn == 8 {
+                    // TLBI: flush this CPU and (inner-shareable broadcast) every other CPU
                     self.flush_tlb();
+                    for o in 0..bus.ncpus {
+                        if o != self.id {
+                            bus.ctl[o].flush_tlb = true;
+                        }
+                    }
                 }
             }
             _ => {}
@@ -899,11 +924,16 @@ impl Aarch64 {
             self.excl = None; // CLREX
         } else if i == 0xd503_207f {
             // ---- WFI: sleep until the next interrupt or timer deadline
-            if !bus.gic.irq_line {
-                bus.idle(self.timer_deadline);
+            if !bus.gic.irq_line[self.id] {
+                // the scheduler skips this CPU until an interrupt (or its timer) wakes it
+                bus.ctl[self.id].waiting = true;
+                self.recheck = true;
             }
         } else if i & 0xfffff01f == 0xd503201f || i & 0xfffff01f == 0xd503301f {
-            // ---- NOP / hints (WFE, YIELD...) / barriers
+            // ---- NOP / hints (WFE, YIELD...) / barriers; WFE and YIELD hand the board to the next CPU
+            if i == 0xd503_205f || i == 0xd503_203f {
+                self.recheck = true;
+            }
         } else if i & 0xfff8f01f == 0xd500401f {
             // ---- MSR (immediate): DAIFSet / DAIFClr / SPSel; others (PAN, UAO...) ignored
             self.recheck = true;
@@ -956,11 +986,54 @@ impl Aarch64 {
             if self.el == 0 {
                 return Err(self.undef(i));
             }
+            const NOT_SUPPORTED: u64 = -1i64 as u64;
+            const INVALID_PARAMS: u64 = -2i64 as u64;
+            const ALREADY_ON: u64 = -4i64 as u64;
+            const ON_PENDING: u64 = -5i64 as u64;
+            let (a1, a2, a3) = (self.x[1], self.x[2], self.x[3]);
             self.x[0] = match self.x[0] as u32 {
                 0x8400_0008 => return Err(Stop::Halt(0).into()), // SYSTEM_OFF
                 0x8400_0009 => return Err(Stop::Reset.into()),   // SYSTEM_RESET
-                0x8400_0000 => 0x0001_0000,                                     // PSCI_VERSION 1.0
-                _ => (-1i64) as u64,                                            // NOT_SUPPORTED
+                0x8400_0000 => 0x0001_0001,                      // PSCI_VERSION 1.1
+                0x8400_0002 => {
+                    // CPU_OFF: this CPU powers down and never returns
+                    bus.ctl[self.id].parked = true;
+                    self.recheck = true;
+                    0
+                }
+                0x8400_0003 | 0xc400_0003 => {
+                    // CPU_ON(target_cpu, entry_point, context_id)
+                    let t = (a1 & 0xff) as usize;
+                    if a1 & !0xff != 0 && a1 & !0xff != 0x8000_0000 || t >= bus.ncpus {
+                        INVALID_PARAMS
+                    } else if bus.ctl[t].start.is_some() {
+                        ON_PENDING
+                    } else if !bus.ctl[t].parked {
+                        ALREADY_ON
+                    } else {
+                        bus.ctl[t].start = Some((a2, a3));
+                        0
+                    }
+                }
+                0x8400_0004 | 0xc400_0004 => {
+                    // AFFINITY_INFO: 0 = ON, 1 = OFF, 2 = ON_PENDING
+                    let t = (a1 & 0xff) as usize;
+                    if t >= bus.ncpus {
+                        INVALID_PARAMS
+                    } else if bus.ctl[t].start.is_some() {
+                        2
+                    } else {
+                        bus.ctl[t].parked as u64
+                    }
+                }
+                0x8400_0006 => 2, // MIGRATE_INFO_TYPE: trusted OS not present / not migratable
+                0x8400_000a => match a1 as u32 {
+                    // PSCI_FEATURES
+                    0x8400_0000 | 0x8400_0002 | 0x8400_0003 | 0xc400_0003 | 0x8400_0004 | 0xc400_0004 | 0x8400_0006
+                    | 0x8400_0008 | 0x8400_0009 | 0x8400_000a => 0,
+                    _ => NOT_SUPPORTED,
+                },
+                _ => NOT_SUPPORTED,
             };
         } else if i & 0xffe0_001f == 0xd440_0000 {
             // ---- HLT: stop the VM, exit code = x0
@@ -1210,7 +1283,7 @@ impl Aarch64 {
 
 impl Default for Aarch64 {
     fn default() -> Self {
-        Self::new()
+        Self::new(0)
     }
 }
 
@@ -1239,12 +1312,30 @@ impl Cpu for Aarch64 {
 
     /// Batched execution: the per-instruction bookkeeping (board clock, timers, interrupt
     /// line, halt flag) is done once per batch of up to `BATCH` instructions.
+    fn wake_deadline(&self, _bus: &Bus) -> u64 {
+        self.timer_deadline
+    }
+
     fn run(&mut self, bus: &mut Bus, n: u64) -> (u64, Option<Stop>) {
         const BATCH: u64 = 32;
+        bus.cur_cpu = self.id;
+        self.service_ctl(bus);
+        if bus.ctl[self.id].parked {
+            return (0, None);
+        }
+        if bus.ctl[self.id].waiting {
+            if bus.clint.mtime >= self.timer_deadline {
+                self.update_timers(bus);
+            }
+            if !bus.gic.irq_line[self.id] {
+                return (0, None); // still asleep
+            }
+            bus.ctl[self.id].waiting = false;
+        }
         let mut done = 0;
         while done < n {
             let k = (n - done).min(BATCH);
-            bus.clint.mtime += k;
+            bus.clint.mtime += bus.ticks(k);
             if self.pre(bus) {
                 done += 1;
                 continue;
@@ -1263,16 +1354,26 @@ impl Cpu for Aarch64 {
             }
             self.recheck = false;
             bus.irq_dirty = false;
-            bus.clint.mtime -= k - j; // give back the unused part of the batch
+            bus.clint.mtime -= bus.ticks(k) - bus.ticks(j); // give back the unused part of the batch
             done += j;
             if let Some(code) = bus.halt {
                 return (done, Some(Stop::Halt(code)));
             }
-            if bus.reset {
+            if bus.reset || bus.ctl[self.id].waiting || bus.ctl[self.id].parked {
                 break;
             }
         }
-        (done, None)
+        // never hand the board to another CPU in the middle of an exclusive sequence
+        let mut extra = 0;
+        while self.excl.is_some() && extra < 64 {
+            extra += 1;
+            if let Err(e) = self.exec(bus) {
+                if let Err(s) = self.handle_ex(bus, e) {
+                    return (done + extra, Some(s));
+                }
+            }
+        }
+        (done + extra, None)
     }
     fn dump(&self) -> String {
         let mut s = format!("pc  = {:#018x}\n", self.pc);

@@ -1,0 +1,26 @@
+AArch64 SMP test
+PSCI version     = 0x0000000000010001
+CPU_ON(self)     = 0xfffffffffffffffc
+CPU_ON(bad)      = 0xfffffffffffffffe
+AFFINITY_INFO(1) = 0x0000000000000001
+CPU_ON            = 0x0000000000000000
+CPU_ON            = 0x0000000000000000
+CPU_ON            = 0x0000000000000000
+AFFINITY_INFO(1) = 0x0000000000000000
+CPU_ON(running)  = 0xfffffffffffffffc
+ldxr counter     = 0x00000000000007d0
+ldadd counter    = 0x00000000000007d0
+locked counter   = 0x00000000000004b0
+mpidr seen       = 0x0000000000000000
+mpidr seen       = 0x0000000000000001
+mpidr seen       = 0x0000000000000002
+mpidr seen       = 0x0000000000000003
+sgi from cpu0 -> cpu0x0000000000000000
+sgi from cpu0 -> cpu0x0000000000000001
+sgi from cpu0 -> cpu0x0000000000000002
+sgi from cpu0 -> cpu0x0000000000000003
+  id seen (0=none) = 0x0000000000000008
+  id seen (0=none) = 0x0000000000000006
+  id seen (0=none) = 0x0000000000000006
+  id seen (0=none) = 0x0000000000000006
+done

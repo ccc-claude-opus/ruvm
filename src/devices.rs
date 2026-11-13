@@ -428,16 +428,19 @@ fn reg_write(reg: &mut u64, off: u64, size: usize, val: u64) {
     *reg = (*reg & !mask) | ((val << sh) & mask);
 }
 
-/// SiFive CLINT (one hart): `msip` @0, `mtimecmp` @0x4000, `mtime` @0xbff8.
+/// Maximum number of CPUs (harts / cores) on the board.
+pub const MAX_CPUS: usize = 8;
+
+/// SiFive CLINT: `msip[hart]` @ 4*hart, `mtimecmp[hart]` @ 0x4000 + 8*hart, `mtime` @ 0xbff8.
 pub struct Clint {
-    pub msip: bool,
-    pub mtimecmp: u64,
+    pub msip: Vec<bool>,
+    pub mtimecmp: Vec<u64>,
     pub mtime: u64,
 }
 
 impl Default for Clint {
     fn default() -> Self {
-        Clint { msip: false, mtimecmp: u64::MAX, mtime: 0 }
+        Clint::new(1)
     }
 }
 
@@ -445,10 +448,17 @@ impl Clint {
     /// Frequency the guest is told `mtime` runs at (device-tree `timebase-frequency`).
     pub const FREQ: u64 = 10_000_000;
 
+    pub fn new(harts: usize) -> Clint {
+        Clint { msip: vec![false; harts], mtimecmp: vec![u64::MAX; harts], mtime: 0 }
+    }
+
     pub fn read(&mut self, off: u64, size: usize) -> u64 {
         match off {
-            0..=3 => self.msip as u64,
-            0x4000..=0x4007 => reg_read(self.mtimecmp, off, size),
+            0..=0x3fff => self.msip.get((off / 4) as usize).map_or(0, |&b| b as u64),
+            0x4000..=0xbff7 => {
+                let h = ((off - 0x4000) / 8) as usize;
+                self.mtimecmp.get(h).map_or(0, |&c| reg_read(c, off, size))
+            }
             0xbff8..=0xbfff => reg_read(self.mtime, off, size),
             _ => 0,
         }
@@ -456,39 +466,58 @@ impl Clint {
 
     pub fn write(&mut self, off: u64, size: usize, val: u64) {
         match off {
-            0 => self.msip = val & 1 != 0,
-            0x4000..=0x4007 => reg_write(&mut self.mtimecmp, off, size, val),
+            0..=0x3fff => {
+                if let Some(b) = self.msip.get_mut((off / 4) as usize) {
+                    *b = val & 1 != 0;
+                }
+            }
+            0x4000..=0xbff7 => {
+                let h = ((off - 0x4000) / 8) as usize;
+                if let Some(c) = self.mtimecmp.get_mut(h) {
+                    reg_write(c, off, size, val);
+                }
+            }
             0xbff8..=0xbfff => reg_write(&mut self.mtime, off, size, val),
             _ => {}
         }
     }
 
     #[inline]
-    pub fn mtip(&self) -> bool {
-        self.mtime >= self.mtimecmp
+    pub fn mtip(&self, hart: usize) -> bool {
+        self.mtime >= self.mtimecmp[hart]
+    }
+
+    /// Earliest timer deadline of any hart (for idle fast-forwarding).
+    pub fn next_deadline(&self) -> u64 {
+        self.mtimecmp.iter().copied().min().unwrap_or(u64::MAX)
     }
 }
 
-/// SiFive PLIC with 127 sources and two contexts (hart 0 M-mode = 0, S-mode = 1).
+/// SiFive PLIC with 127 sources and two contexts per hart (M-mode = 2*hart, S-mode = 2*hart + 1).
 ///   priority @ 4*src, pending @ 0x1000, enables @ 0x2000 + 0x80*ctx,
 ///   threshold @ 0x20_0000 + 0x1000*ctx, claim/complete @ threshold + 4.
 pub struct Plic {
     priority: [u32; 128],
     pending: u128,
     claimed: u128,
-    enable: [u128; 2],
-    threshold: [u32; 2],
+    enable: Vec<u128>,
+    threshold: Vec<u32>,
     /// Interrupt output of each context (MEIP / SEIP).
-    pub out: [bool; 2],
+    pub out: Vec<bool>,
 }
 
 impl Default for Plic {
     fn default() -> Self {
-        Plic { priority: [0; 128], pending: 0, claimed: 0, enable: [0; 2], threshold: [0; 2], out: [false; 2] }
+        Plic::new(1)
     }
 }
 
 impl Plic {
+    pub fn new(harts: usize) -> Plic {
+        let n = 2 * harts;
+        Plic { priority: [0; 128], pending: 0, claimed: 0, enable: vec![0; n], threshold: vec![0; n], out: vec![false; n] }
+    }
+
     /// Sample a level-triggered source. As in the PLIC gateway (and QEMU), a high
     /// level latches the pending bit; only a claim clears it.
     pub fn set_level(&mut self, src: u32, level: bool) {
@@ -512,7 +541,7 @@ impl Plic {
     }
 
     fn update(&mut self) {
-        for ctx in 0..2 {
+        for ctx in 0..self.out.len() {
             self.out[ctx] = self.best(ctx) != 0;
         }
     }
@@ -525,13 +554,16 @@ impl Plic {
         match off {
             0..=0x1ff => self.priority[(off / 4) as usize] as u64,
             0x1000..=0x100f => Self::word(self.pending, (off - 0x1000) / 4),
-            0x2000..=0x20ff => {
+            0x2000..=0x27ff => {
                 let ctx = ((off - 0x2000) / 0x80) as usize;
                 let w = (off & 0x7f) / 4;
-                if ctx < 2 && w < 4 { Self::word(self.enable[ctx], w) } else { 0 }
+                if ctx < self.enable.len() && w < 4 { Self::word(self.enable[ctx], w) } else { 0 }
             }
-            0x20_0000..=0x20_1fff => {
+            0x20_0000..=0x21_ffff => {
                 let ctx = ((off - 0x20_0000) / 0x1000) as usize;
+                if ctx >= self.threshold.len() {
+                    return 0;
+                }
                 match off & 0xfff {
                     0 => self.threshold[ctx] as u64,
                     4 => {
@@ -554,17 +586,20 @@ impl Plic {
         let v = val as u32;
         match off {
             0..=0x1ff => self.priority[(off / 4) as usize] = v & 7,
-            0x2000..=0x20ff => {
+            0x2000..=0x27ff => {
                 let ctx = ((off - 0x2000) / 0x80) as usize;
                 let w = (off & 0x7f) / 4;
-                if ctx < 2 && w < 4 {
+                if ctx < self.enable.len() && w < 4 {
                     let mask = 0xffff_ffffu128 << (32 * w);
                     self.enable[ctx] = (self.enable[ctx] & !mask) | ((v as u128) << (32 * w) & mask);
                     self.enable[ctx] &= !1; // source 0 does not exist
                 }
             }
-            0x20_0000..=0x20_1fff => {
+            0x20_0000..=0x21_ffff => {
                 let ctx = ((off - 0x20_0000) / 0x1000) as usize;
+                if ctx >= self.threshold.len() {
+                    return;
+                }
                 match off & 0xfff {
                     0 => self.threshold[ctx] = v & 7,
                     4 if v < 128 => self.claimed &= !(1u128 << v), // complete

@@ -55,7 +55,9 @@ impl Arch {
 
 pub struct Machine {
     pub arch: Arch,
-    pub cpu: Box<dyn Cpu>,
+    /// All CPUs (harts / cores); CPU 0 is the boot CPU.
+    pub cpus: Vec<Box<dyn Cpu>>,
+    ncpus: usize,
     pub bus: Bus,
     pub trace: bool,
     pub insns: u64,
@@ -117,11 +119,22 @@ pub fn is_linux_image(arch: Arch, data: &[u8]) -> bool {
 }
 
 impl Machine {
+    /// The boot CPU.
+    pub fn cpu(&self) -> &dyn Cpu {
+        &*self.cpus[0]
+    }
+
     /// Memory map (same addresses as QEMU's `virt` boards)
     ///   riscv64: 0x0010_0000 test finisher, 0x0200_0000 CLINT, 0x0c00_0000 PLIC,
     ///            0x1000_0000 NS16550 UART (PLIC irq 10), RAM @ 0x8000_0000
     ///   aarch64: 0x0900_0000 PL011 UART,                              RAM @ 0x4000_0000
     pub fn new(arch: Arch, ram_mb: usize, interactive: bool) -> Machine {
+        Self::with_cpus(arch, ram_mb, interactive, 1)
+    }
+
+    /// A machine with `ncpus` CPUs (1..=8), scheduled round-robin on the calling thread.
+    pub fn with_cpus(arch: Arch, ram_mb: usize, interactive: bool, ncpus: usize) -> Machine {
+        let ncpus = ncpus.clamp(1, crate::devices::MAX_CPUS);
         let (console_tx, console_rx) = channel();
         if interactive {
             forward_stdin(console_tx.clone());
@@ -129,7 +142,8 @@ impl Machine {
         let bus = Bus::new(arch.ram_base(), ram_mb << 20);
         let mut m = Machine {
             arch,
-            cpu: Box::new(Riscv64::new()),
+            cpus: Vec::new(),
+            ncpus,
             bus,
             trace: false,
             insns: 0,
@@ -150,23 +164,23 @@ impl Machine {
     fn build_board(&mut self) {
         let arch = self.arch;
         let interactive = self.bus.interactive;
-        let mut bus = Bus::new(arch.ram_base(), self.ram_mb << 20);
+        let mut bus = Bus::with_cpus(arch.ram_base(), self.ram_mb << 20, self.ncpus);
         bus.interactive = interactive;
         let (rx, script) = (Some(self.console_rx.clone()), self.script.clone());
-        let cpu: Box<dyn Cpu> = match arch {
+        let cpus: Vec<Box<dyn Cpu>> = match arch {
             Arch::Riscv64 => {
                 bus.map(0x10_0000, 0x1000, Box::new(TestFinisher::default()));
                 bus.map_irq(0x10_1000, 0x1000, 11, Box::new(GoldfishRtc::new(self.rtc_epoch)));
                 bus.map_clint(0x200_0000);
                 bus.map_plic(0xc00_0000);
                 bus.map_irq(0x1000_0000, 0x100, 10, Box::new(Uart::new(UartKind::Ns16550, rx, script)));
-                Box::new(Riscv64::new())
+                (0..self.ncpus).map(|i| Box::new(Riscv64::new(i)) as Box<dyn Cpu>).collect()
             }
             Arch::Aarch64 => {
                 bus.map_gic(0x0800_0000);
                 bus.map_irq(0x0900_0000, 0x1000, 33, Box::new(Pl011::new(rx, script)));
                 bus.map_irq(0x0901_0000, 0x1000, 34, Box::new(Pl031::new(self.rtc_epoch)));
-                Box::new(Aarch64::new())
+                (0..self.ncpus).map(|i| Box::new(Aarch64::new(i)) as Box<dyn Cpu>).collect()
             }
         };
         bus.realtime_idle = self.devices.iter().any(|d| matches!(d, DevSpec::Net(_)));
@@ -180,8 +194,17 @@ impl Machine {
             bus.map_irq(base, size, irq, Box::new(VirtioMmio::new(backend)));
         }
         self.bus = bus;
-        self.cpu = cpu;
-        self.cpu.set_pc(arch.ram_base());
+        self.cpus = cpus;
+        for c in &mut self.cpus {
+            c.set_pc(arch.ram_base());
+        }
+        // ARM secondary CPUs are powered off until PSCI CPU_ON; RISC-V harts all start (a0 = hartid)
+        // unless the built-in SBI parks the secondaries for HSM (see `boot_linux`)
+        for i in 1..self.ncpus {
+            if arch == Arch::Aarch64 {
+                self.bus.ctl[i].parked = true;
+            }
+        }
     }
 
     /// Start the RTCs at this Unix time instead of following the host clock.
@@ -274,22 +297,24 @@ impl Machine {
                 t.u32("#address-cells", 1);
                 t.u32("#size-cells", 0);
                 t.u32("timebase-frequency", Clint::FREQ as u32);
-                t.begin("cpu@0");
-                t.str("device_type", "cpu");
-                t.u32("reg", 0);
-                t.str("status", "okay");
-                t.str("compatible", "riscv");
-                t.str("riscv,isa", "rv64imafdc_zicntr_zicsr_zifencei_sstc");
-                t.str("riscv,isa-base", "rv64i");
-                t.strs("riscv,isa-extensions", &["i", "m", "a", "f", "d", "c", "zicntr", "zicsr", "zifencei", "sstc"]);
-                t.str("mmu-type", "riscv,sv39");
-                t.begin("interrupt-controller");
-                t.u32("#interrupt-cells", 1);
-                t.empty("interrupt-controller");
-                t.str("compatible", "riscv,cpu-intc");
-                t.u32("phandle", 1);
-                t.end();
-                t.end();
+                for h in 0..self.ncpus {
+                    t.begin(&format!("cpu@{h}"));
+                    t.str("device_type", "cpu");
+                    t.u32("reg", h as u32);
+                    t.str("status", "okay");
+                    t.str("compatible", "riscv");
+                    t.str("riscv,isa", "rv64imafdc_zicntr_zicsr_zifencei_sstc");
+                    t.str("riscv,isa-base", "rv64i");
+                    t.strs("riscv,isa-extensions", &["i", "m", "a", "f", "d", "c", "zicntr", "zicsr", "zifencei", "sstc"]);
+                    t.str("mmu-type", "riscv,sv39");
+                    t.begin("interrupt-controller");
+                    t.u32("#interrupt-cells", 1);
+                    t.empty("interrupt-controller");
+                    t.str("compatible", "riscv,cpu-intc");
+                    t.u32("phandle", 16 + h as u32);
+                    t.end();
+                    t.end();
+                }
                 t.end();
                 t.begin("soc");
                 t.u32("#address-cells", 2);
@@ -299,7 +324,7 @@ impl Machine {
                 t.begin("clint@2000000");
                 t.strs("compatible", &["sifive,clint0", "riscv,clint0"]);
                 t.u64s("reg", &[0x200_0000, 0x1_0000]);
-                t.u32s("interrupts-extended", &[1, 3, 1, 7]);
+                t.u32s("interrupts-extended", &(0..self.ncpus as u32).flat_map(|h| [16 + h, 3, 16 + h, 7]).collect::<Vec<_>>());
                 t.end();
                 t.begin("plic@c000000");
                 t.strs("compatible", &["sifive,plic-1.0.0", "riscv,plic0"]);
@@ -308,7 +333,7 @@ impl Machine {
                 t.u32("#address-cells", 0);
                 t.empty("interrupt-controller");
                 t.u32("riscv,ndev", 127);
-                t.u32s("interrupts-extended", &[1, 11, 1, 9]);
+                t.u32s("interrupts-extended", &(0..self.ncpus as u32).flat_map(|h| [16 + h, 11, 16 + h, 9]).collect::<Vec<_>>());
                 t.u32("phandle", 2);
                 t.end();
                 t.begin("serial@10000000");
@@ -374,12 +399,14 @@ impl Machine {
                 t.begin("cpus");
                 t.u32("#address-cells", 1);
                 t.u32("#size-cells", 0);
-                t.begin("cpu@0");
-                t.str("device_type", "cpu");
-                t.str("compatible", "arm,cortex-a57");
-                t.u32("reg", 0);
-                t.str("enable-method", "psci");
-                t.end();
+                for c in 0..self.ncpus {
+                    t.begin(&format!("cpu@{c}"));
+                    t.str("device_type", "cpu");
+                    t.str("compatible", "arm,cortex-a57");
+                    t.u32("reg", c as u32);
+                    t.str("enable-method", "psci");
+                    t.end();
+                }
                 t.end();
                 t.begin("interrupt-controller@8000000");
                 t.str("compatible", "arm,cortex-a15-gic");
@@ -392,7 +419,8 @@ impl Machine {
                 t.str("compatible", "arm,armv8-timer");
                 t.empty("always-on");
                 // secure phys (13), non-secure phys (14), virtual (11), hypervisor (10); level low
-                t.u32s("interrupts", &[1, 13, 0xf08, 1, 14, 0xf08, 1, 11, 0xf08, 1, 10, 0xf08]);
+                let flags = (((1u32 << self.ncpus) - 1) << 8) | 8; // CPU mask + level low
+                t.u32s("interrupts", &[1, 13, flags, 1, 14, flags, 1, 11, flags, 1, 10, flags]);
                 t.end();
                 t.begin("apb-pclk");
                 t.str("compatible", "fixed-clock");
@@ -480,9 +508,15 @@ impl Machine {
 
         match self.arch {
             Arch::Riscv64 => {
-                let cpu = self.cpu.as_any().downcast_mut::<Riscv64>().unwrap();
                 match &b.bios {
-                    None => cpu.boot_supervisor(kernel_addr, dtb_addr),
+                    None => {
+                        // built-in SBI: hart 0 boots, the others wait for SBI HSM hart_start
+                        let cpu = self.cpus[0].as_any().downcast_mut::<Riscv64>().unwrap();
+                        cpu.boot_supervisor(kernel_addr, dtb_addr);
+                        for i in 1..self.ncpus {
+                            self.bus.ctl[i].parked = true;
+                        }
+                    }
                     Some(fw) => {
                         // OpenSBI fw_dynamic: a0 = hartid, a1 = dtb, a2 = &fw_dynamic_info
                         self.bus.load(base, fw)?;
@@ -490,15 +524,19 @@ impl Machine {
                         let words: [u64; 6] = [0x4942_534f, 2, kernel_addr, 1, 0, 0];
                         let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
                         self.bus.load(info, &bytes)?;
-                        cpu.set_pc(base);
-                        cpu.set_reg(10, 0);
-                        cpu.set_reg(11, dtb_addr);
-                        cpu.set_reg(12, info);
+                        // every hart enters the firmware (OpenSBI elects the cold-boot hart itself)
+                        for (h, c) in self.cpus.iter_mut().enumerate() {
+                            let cpu = c.as_any().downcast_mut::<Riscv64>().unwrap();
+                            cpu.set_pc(base);
+                            cpu.set_reg(10, h as u64);
+                            cpu.set_reg(11, dtb_addr);
+                            cpu.set_reg(12, info);
+                        }
                     }
                 }
             }
             Arch::Aarch64 => {
-                let cpu = self.cpu.as_any().downcast_mut::<Aarch64>().unwrap();
+                let cpu = self.cpus[0].as_any().downcast_mut::<Aarch64>().unwrap();
                 cpu.set_pc(kernel_addr);
                 cpu.set_reg(0, dtb_addr);
             }
@@ -507,10 +545,22 @@ impl Machine {
         Ok(dtb)
     }
 
+    /// Bare-metal start: CPU 0 runs at `entry`; RISC-V harts all start there with a0 = hartid
+    /// (like QEMU `-bios none`), ARM secondaries stay off until PSCI CPU_ON.
+    fn start_cpus(&mut self, entry: u64) {
+        self.cpus[0].set_pc(entry);
+        if self.arch == Arch::Riscv64 {
+            for (h, c) in self.cpus.iter_mut().enumerate() {
+                c.set_pc(entry);
+                c.as_any().downcast_mut::<Riscv64>().unwrap().set_reg(10, h as u64);
+            }
+        }
+    }
+
     /// Load a raw binary at `addr` and start executing there.
     pub fn load_raw(&mut self, addr: u64, data: &[u8]) -> Result<(), String> {
         self.bus.load(addr, data)?;
-        self.cpu.set_pc(addr);
+        self.start_cpus(addr);
         self.boot = Some(BootRecord::Raw(addr, data.to_vec()));
         Ok(())
     }
@@ -519,7 +569,7 @@ impl Machine {
     pub fn load_image(&mut self, data: &[u8]) -> Result<(), String> {
         if data.starts_with(b"\x7fELF") {
             let entry = self.load_elf(data)?;
-            self.cpu.set_pc(entry);
+            self.start_cpus(entry);
             self.boot = Some(BootRecord::Image(data.to_vec()));
             Ok(())
         } else {
@@ -556,27 +606,42 @@ impl Machine {
         Ok(entry)
     }
 
-    /// Run until the guest halts, faults, or `max_insns` instructions have executed.
+    /// Run until the guest halts, faults, or `max_insns` instructions (summed over all CPUs)
+    /// have executed. CPUs take turns on this thread: each runs a quantum of instructions,
+    /// sleeping (WFI) or powered-off CPUs are skipped, and when every CPU is idle the board
+    /// clock jumps to the earliest wake-up time.
     pub fn run(&mut self, max_insns: Option<u64>) -> Stop {
-        const BATCH: u64 = 4096;
+        let quantum: u64 = if self.ncpus == 1 { 4096 } else { 512 };
         loop {
-            let left = max_insns.map_or(BATCH, |m| m.saturating_sub(self.insns).min(BATCH));
-            if left == 0 {
-                return Stop::Limit;
+            let mut ran_any = false;
+            for id in 0..self.ncpus {
+                let left = max_insns.map_or(quantum, |m| m.saturating_sub(self.insns).min(quantum));
+                if left == 0 {
+                    return Stop::Limit;
+                }
+                if self.trace {
+                    // trace mode: one instruction at a time (raw word read at the physical pc)
+                    let pc = self.cpus[id].pc();
+                    let raw = self.bus.read(pc, 4).unwrap_or(0);
+                    eprintln!("[{:>10}] cpu{id} {:#018x}: {:08x}", self.insns, pc, raw);
+                }
+                let (ran, stop) = self.cpus[id].run(&mut self.bus, if self.trace { 1 } else { left });
+                self.insns += ran;
+                ran_any |= ran > 0;
+                if let Some(s) = stop {
+                    return s;
+                }
+                if self.bus.reset {
+                    return Stop::Reset;
+                }
             }
-            if self.trace {
-                // trace mode: one instruction at a time (raw word read at the physical pc)
-                let pc = self.cpu.pc();
-                let raw = self.bus.read(pc, 4).unwrap_or(0);
-                eprintln!("[{:>10}] {:#018x}: {:08x}", self.insns, pc, raw);
-            }
-            let (ran, stop) = self.cpu.run(&mut self.bus, if self.trace { 1 } else { left });
-            self.insns += ran;
-            if let Some(s) = stop {
-                return s;
-            }
-            if self.bus.reset {
-                return Stop::Reset;
+            if !ran_any {
+                // every CPU sleeps or is off
+                if self.bus.ctl.iter().all(|c| c.parked && c.start.is_none()) {
+                    return Stop::Fatal("all CPUs are powered off".into());
+                }
+                let deadline = self.cpus.iter().map(|c| c.wake_deadline(&self.bus)).min().unwrap_or(u64::MAX);
+                self.bus.idle(deadline);
             }
             self.bus.poll_irqs(); // pick up console input and asynchronous device work
         }
