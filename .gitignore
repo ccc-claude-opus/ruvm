@@ -29,3 +29,4 @@ rustc-ice-*.txt
 # generated guest test sources (tests/guest/gen_*.py)
 tests/guest/a64_fp.c
 tests/guest/a64_neon.c
+tests/guest/rv_bitmanip.c

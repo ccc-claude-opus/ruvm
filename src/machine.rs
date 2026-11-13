@@ -303,10 +303,21 @@ impl Machine {
                     t.u32("reg", h as u32);
                     t.str("status", "okay");
                     t.str("compatible", "riscv");
-                    t.str("riscv,isa", "rv64imafdc_zicntr_zicsr_zifencei_sstc");
+                    t.str(
+                        "riscv,isa",
+                        "rv64imafdc_zicbom_zicboz_zicntr_zicond_zicsr_zifencei_zihintpause_zba_zbb_zbc_zbs_sstc_svinval",
+                    );
                     t.str("riscv,isa-base", "rv64i");
-                    t.strs("riscv,isa-extensions", &["i", "m", "a", "f", "d", "c", "zicntr", "zicsr", "zifencei", "sstc"]);
-                    t.str("mmu-type", "riscv,sv39");
+                    t.strs(
+                        "riscv,isa-extensions",
+                        &[
+                            "i", "m", "a", "f", "d", "c", "zicbom", "zicboz", "zicntr", "zicond", "zicsr", "zifencei", "zihintpause",
+                            "zba", "zbb", "zbc", "zbs", "sstc", "svinval",
+                        ],
+                    );
+                    t.u32("riscv,cbom-block-size", 64);
+                    t.u32("riscv,cboz-block-size", 64);
+                    t.str("mmu-type", "riscv,sv48");
                     t.begin("interrupt-controller");
                     t.u32("#interrupt-cells", 1);
                     t.empty("interrupt-controller");

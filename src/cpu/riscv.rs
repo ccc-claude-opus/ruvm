@@ -180,6 +180,34 @@ pub struct Riscv64 {
     rvc_table: Box<[u32]>,
     /// Interrupt-relevant state changed: end the current batch so `pre` runs again.
     recheck: bool,
+    /// PMP: active regions in priority order, whether S/U accesses are unrestricted, and
+    /// whether any locked region constrains M-mode.
+    pmp: Vec<PmpEntry>,
+    pmp_all: bool,
+    pmp_locked_any: bool,
+}
+
+#[derive(Clone, Copy)]
+struct PmpEntry {
+    lo: u64,
+    hi: u64,
+    /// bit 0 = R, bit 1 = W, bit 2 = X
+    perm: u8,
+    locked: bool,
+}
+
+/// Carry-less multiply: (low 64 bits, high 64 bits) of the 128-bit product.
+fn clmul128(a: u64, b: u64) -> (u64, u64) {
+    let (mut lo, mut hi) = (0u64, 0u64);
+    for k in 0..64 {
+        if b >> k & 1 == 1 {
+            lo ^= a << k;
+            if k > 0 {
+                hi ^= a >> (64 - k);
+            }
+        }
+    }
+    (lo, hi)
 }
 
 #[inline]
@@ -247,7 +275,7 @@ impl Riscv64 {
     pub fn new(id: usize) -> Self {
         let mut csr = vec![0u64; 4096];
         // RV64 (MXL=2), extensions A C D F I M S U
-        csr[MISA] = (2u64 << 62) | 1 | (1 << 2) | (1 << 3) | (1 << 5) | (1 << 8) | (1 << 12) | (1 << 18) | (1 << 20);
+        csr[MISA] = (2u64 << 62) | 1 | (1 << 1) | (1 << 2) | (1 << 3) | (1 << 5) | (1 << 8) | (1 << 12) | (1 << 18) | (1 << 20);
         csr[MSTATUS] = MS_UXL_SXL;
         csr[STIMECMP] = u64::MAX;
         Riscv64 {
@@ -268,6 +296,9 @@ impl Riscv64 {
             sbi: false,
             id,
             recheck: false,
+            pmp: Vec::new(),
+            pmp_all: false,
+            pmp_locked_any: false,
             rvc_table: (0..=u16::MAX).map(|c| rvc::expand(c).unwrap_or(0)).collect(),
         }
     }
@@ -293,7 +324,11 @@ impl Riscv64 {
         self.csr[MEDELEG] = 0xb1ff | 1 << 12 | 1 << 13 | 1 << 15;
         self.csr[MIDELEG] = S_INTS;
         self.csr[MCOUNTEREN] = 0xffff_ffff;
-        self.csr[MENVCFG] = 1 << 63 | 1 << 61; // STCE (Sstc), ADUE (hardware A/D)
+        self.csr[MENVCFG] = 1 << 63 | 1 << 61 | 3 << 4 | 1 << 6 | 1 << 7; // STCE, ADUE, CBIE/CBCFE/CBZE
+        // like OpenSBI: let S/U-mode reach all of memory
+        self.csr[0x3b0] = (1 << 54) - 1;
+        self.csr[0x3a0] = 0x1f; // NAPOT, RWX
+        self.pmp_rebuild();
     }
 
     /// SBI v2.0 subset: BASE, TIME, IPI, RFENCE, HSM, SRST, DBCN, PMU and the legacy calls.
@@ -463,7 +498,9 @@ impl Riscv64 {
             STVEC | SCOUNTEREN | SENVCFG | SSCRATCH | SEPC | SCAUSE | STVAL | SATP | STIMECMP => self.csr[a],
             MISA | MEDELEG | MIDELEG | MIE | MTVEC | MCOUNTEREN | MENVCFG | MCOUNTINHIBIT
             | MSCRATCH | MEPC | MCAUSE | MTVAL => self.csr[a],
-            0x3a0..=0x3ef => self.csr[a], // pmpcfg / pmpaddr: stored, not enforced
+            0x3a0 | 0x3a2 | 0x3b0..=0x3bf => self.csr[a], // pmpcfg0/2, pmpaddr0-15 (16 regions)
+            0x3a1 | 0x3a3 => return None,               // odd pmpcfg registers do not exist on RV64
+            0x3a4..=0x3af | 0x3c0..=0x3ef => 0,         // regions 16.. are not implemented: read as zero
             0xb00 | 0xb02 | 0xc00 | 0xc02 => self.insns, // mcycle minstret cycle instret
             0xc01 => self.time,
             0xb03..=0xb1f | 0xc03..=0xc1f | 0x323..=0x33f => 0, // hpm counters / events
@@ -516,11 +553,12 @@ impl Riscv64 {
             MEPC | SEPC => self.csr[a] = v & !1,
             SATP => {
                 let mode = v >> 60;
-                if mode == 0 || mode == 8 {
+                if mode == 0 || mode == 8 || mode == 9 {
                     self.csr[SATP] = v; // ASID bits kept but unused (TLB is flushed instead)
                     self.flush_tlb();
                 }
             }
+            0x3a0..=0x3ef => self.pmp_csr_write(a, v),
             MCOUNTEREN | SCOUNTEREN => self.csr[a] = v & 0xffff_ffff,
             MISA | MCOUNTINHIBIT | 0xb00..=0xb1f | 0x323..=0x33f => {} // WARL, read-only zero or ignored
             _ => self.csr[a] = v,
@@ -646,15 +684,97 @@ impl Riscv64 {
     }
 
     /// Virtual -> physical translation (Sv39).
+    /// Virtual -> physical address translation followed by the PMP check.
+    #[inline]
     fn translate(&mut self, bus: &mut Bus, va: u64, acc: Access) -> Result<u64, Ex> {
+        let pa = self.translate_va(bus, va, acc)?;
+        let ms = self.csr[MSTATUS];
+        let prv = if acc != Access::Fetch && ms & MS_MPRV != 0 { (ms >> 11) & 3 } else { self.prv };
+        if (prv < PRV_M && !self.pmp_all) || (prv == PRV_M && self.pmp_locked_any) {
+            if !self.pmp_allows(pa, acc, prv) {
+                return Err(Ex::Trap(acc.access_fault(), va));
+            }
+        }
+        Ok(pa)
+    }
+
+    /// PMP lookup: the first (lowest-numbered) matching region decides; with no match M-mode
+    /// is allowed and S/U-mode is not.
+    fn pmp_allows(&self, pa: u64, acc: Access, prv: u64) -> bool {
+        let need = match acc {
+            Access::Load => 1,
+            Access::Store => 2,
+            Access::Fetch => 4,
+        };
+        for e in &self.pmp {
+            if pa >= e.lo && pa < e.hi {
+                return (prv == PRV_M && !e.locked) || e.perm & need != 0;
+            }
+        }
+        prv == PRV_M
+    }
+
+    /// Recompute the active PMP regions from pmpcfg0/2 and pmpaddr0..15.
+    fn pmp_rebuild(&mut self) {
+        self.pmp.clear();
+        self.pmp_locked_any = false;
+        let mut prev_addr = 0u64;
+        for k in 0..16usize {
+            let cfg = (self.csr[0x3a0 + 2 * (k / 8)] >> (8 * (k % 8))) as u8;
+            let addr = self.csr[0x3b0 + k];
+            let (lo, hi) = match (cfg >> 3) & 3 {
+                0 => (0, 0), // OFF
+                1 => (prev_addr << 2, addr << 2), // TOR
+                2 => (addr << 2, (addr << 2) + 4), // NA4
+                _ => {
+                    let mask = addr ^ addr.wrapping_add(1);
+                    ((addr & !mask) << 2, ((addr & !mask) << 2).saturating_add((mask.wrapping_add(1)) << 2))
+                }
+            };
+            if hi > lo {
+                let locked = cfg & 0x80 != 0;
+                self.pmp_locked_any |= locked;
+                self.pmp.push(PmpEntry { lo, hi, perm: cfg & 7, locked });
+            }
+            prev_addr = addr;
+        }
+        // one region covering everything with RWX (what OpenSBI and xv6 configure)
+        self.pmp_all = matches!(self.pmp.first(), Some(e) if e.lo == 0 && e.hi >= 1 << 56 && e.perm == 7);
+    }
+
+    fn pmp_csr_write(&mut self, a: usize, v: u64) {
+        if (0x3a0..=0x3af).contains(&a) {
+            if a & 1 == 0 && a < 0x3a4 {
+                let old = self.csr[a];
+                let mut new = 0u64;
+                for k in 0..8 {
+                    let byte = if old >> (8 * k) & 0x80 != 0 { old >> (8 * k) } else { v >> (8 * k) };
+                    new |= (byte & 0x9f) << (8 * k);
+                }
+                self.csr[a] = new;
+            }
+        } else if (0x3b0..=0x3bf).contains(&a) {
+            let k = a - 0x3b0;
+            let cfg_of = |s: &Self, n: usize| (s.csr[0x3a0 + 2 * (n / 8)] >> (8 * (n % 8))) as u8;
+            let locked = cfg_of(self, k) & 0x80 != 0;
+            let tor_next_locked = k + 1 < 16 && cfg_of(self, k + 1) & 0x80 != 0 && (cfg_of(self, k + 1) >> 3) & 3 == 1;
+            if !locked && !tor_next_locked {
+                self.csr[a] = v & ((1 << 54) - 1);
+            }
+        }
+        self.pmp_rebuild();
+    }
+
+    fn translate_va(&mut self, bus: &mut Bus, va: u64, acc: Access) -> Result<u64, Ex> {
         let ms = self.csr[MSTATUS];
         let prv = if acc != Access::Fetch && ms & MS_MPRV != 0 { (ms >> 11) & 3 } else { self.prv };
         let satp = self.csr[SATP];
-        if prv == PRV_M || satp >> 60 != 8 {
+        let mode = satp >> 60;
+        if prv == PRV_M || (mode != 8 && mode != 9) {
             return Ok(va);
         }
         let pf = Ex::Trap(acc.page_fault(), va);
-        if sext(va, 39) != va {
+        if sext(va, if mode == 8 { 39 } else { 48 }) != va {
             return Err(pf);
         }
         let vpn = va >> 12;
@@ -669,7 +789,7 @@ impl Riscv64 {
 
         // page-table walk
         let mut table = (satp & ((1 << 44) - 1)) << 12;
-        let mut level = 2;
+        let mut level = if mode == 8 { 2 } else { 3 };
         let (pte, pte_addr) = loop {
             let addr = table + ((vpn >> (9 * level)) & 0x1ff) * 8;
             let pte = bus.read(addr, 8).map_err(|_| Ex::Trap(acc.access_fault(), va))?;
@@ -860,11 +980,25 @@ impl Riscv64 {
                 let v = match f3 {
                     0 => a.wrapping_add(imm_i),
                     1 if (i >> 26) == 0 => a << sh,
+                    1 if (i >> 20) == 0x600 => a.leading_zeros() as u64,                 // clz
+                    1 if (i >> 20) == 0x601 => a.trailing_zeros() as u64,                // ctz
+                    1 if (i >> 20) == 0x602 => a.count_ones() as u64,                    // cpop
+                    1 if (i >> 20) == 0x604 => a as i8 as i64 as u64,                    // sext.b
+                    1 if (i >> 20) == 0x605 => a as i16 as i64 as u64,                   // sext.h
+                    1 if (i >> 26) == 0b010010 => a & !(1u64 << sh),                     // bclri
+                    1 if (i >> 26) == 0b011010 => a ^ (1u64 << sh),                      // binvi
+                    1 if (i >> 26) == 0b001010 => a | (1u64 << sh),                      // bseti
                     2 => ((a as i64) < (imm_i as i64)) as u64,
                     3 => (a < imm_i) as u64,
                     4 => a ^ imm_i,
                     5 if (i >> 26) == 0 => a >> sh,
                     5 if (i >> 26) == 0x10 => ((a as i64) >> sh) as u64,
+                    5 if (i >> 26) == 0b011000 => a.rotate_right(sh),                    // rori
+                    5 if (i >> 26) == 0b010010 => a >> sh & 1,                           // bexti
+                    5 if (i >> 20) == 0x6b8 => a.swap_bytes(),                           // rev8
+                    5 if (i >> 20) == 0x287 => (0..8).fold(0u64, |r, k| {                // orc.b
+                        if a >> (8 * k) & 0xff != 0 { r | 0xffu64 << (8 * k) } else { r }
+                    }),
                     6 => a | imm_i,
                     7 => a & imm_i,
                     _ => return Err(illegal),
@@ -876,8 +1010,13 @@ impl Riscv64 {
                 let v = match (f3, f7) {
                     (0, _) => sx32((a as u32).wrapping_add(imm_i as u32)),
                     (1, 0) => sx32((a as u32) << sh),
+                    (1, _) if (i >> 26) == 0b000010 => (a & 0xffff_ffff) << ((i >> 20) & 0x3f), // slli.uw
+                    (1, 0x30) if (i >> 20) & 0x1f == 0 => (a as u32).leading_zeros() as u64,   // clzw
+                    (1, 0x30) if (i >> 20) & 0x1f == 1 => (a as u32).trailing_zeros() as u64,  // ctzw
+                    (1, 0x30) if (i >> 20) & 0x1f == 2 => (a as u32).count_ones() as u64,      // cpopw
                     (5, 0) => sx32((a as u32) >> sh),
                     (5, 0x20) => ((a as i32) >> sh) as i64 as u64,
+                    (5, 0x30) => sx32((a as u32).rotate_right(sh)),                            // roriw
                     _ => return Err(illegal),
                 };
                 self.set(rd, v);
@@ -902,6 +1041,36 @@ impl Riscv64 {
                     (0x20, 5) => ((a as i64) >> (b & 63)) as u64,
                     (0, 6) => a | b,
                     (0, 7) => a & b,
+                    // Zba
+                    (0x10, 2) => (a << 1).wrapping_add(b),
+                    (0x10, 4) => (a << 2).wrapping_add(b),
+                    (0x10, 6) => (a << 3).wrapping_add(b),
+                    // Zbb
+                    (0x20, 7) => a & !b,
+                    (0x20, 6) => a | !b,
+                    (0x20, 4) => !(a ^ b),
+                    (5, 4) => (a as i64).min(b as i64) as u64,
+                    (5, 5) => a.min(b),
+                    (5, 6) => (a as i64).max(b as i64) as u64,
+                    (5, 7) => a.max(b),
+                    (0x30, 1) => a.rotate_left((b & 63) as u32),
+                    (0x30, 5) => a.rotate_right((b & 63) as u32),
+                    // Zbs
+                    (0x24, 1) => a & !(1u64 << (b & 63)),
+                    (0x24, 5) => a >> (b & 63) & 1,
+                    (0x34, 1) => a ^ (1u64 << (b & 63)),
+                    (0x14, 1) => a | (1u64 << (b & 63)),
+                    // Zbc
+                    (5, 1) => clmul128(a, b).0,
+                    (5, 3) => clmul128(a, b).1,
+                    (5, 2) => {
+                        // clmulr: bits 126..63 of the product
+                        let (lo, hi) = clmul128(a, b);
+                        hi << 1 | lo >> 63
+                    }
+                    // Zicond
+                    (7, 5) => if b == 0 { 0 } else { a },
+                    (7, 7) => if b != 0 { 0 } else { a },
                     _ => return Err(illegal),
                 };
                 self.set(rd, v);
@@ -919,9 +1088,46 @@ impl Riscv64 {
                     (0, 1) => sx32(x << (y & 31)),
                     (0, 5) => sx32(x >> (y & 31)),
                     (0x20, 5) => ((x as i32) >> (y & 31)) as i64 as u64,
+                    (4, 0) => (a & 0xffff_ffff).wrapping_add(b),                       // add.uw
+                    (4, 4) if rs2 == 0 => a & 0xffff,                                  // zext.h
+                    (0x10, 2) => ((a & 0xffff_ffff) << 1).wrapping_add(b),             // sh1add.uw
+                    (0x10, 4) => ((a & 0xffff_ffff) << 2).wrapping_add(b),             // sh2add.uw
+                    (0x10, 6) => ((a & 0xffff_ffff) << 3).wrapping_add(b),             // sh3add.uw
+                    (0x30, 1) => sx32(x.rotate_left(y & 31)),                          // rolw
+                    (0x30, 5) => sx32(x.rotate_right(y & 31)),                         // rorw
                     _ => return Err(illegal),
                 };
                 self.set(rd, v);
+            }
+            0x0f if f3 == 2 => {
+                // Zicbom / Zicboz: cbo.inval / clean / flush / zero (cache blocks are 64 bytes)
+                let imm = i >> 20;
+                let (menv, senv) = (self.csr[MENVCFG], self.csr[0x10a]);
+                let allowed = |field_mask: u64, nonzero: bool| {
+                    let f = |c: u64| if nonzero { c & field_mask != 0 } else { c & field_mask != 0 };
+                    self.prv == PRV_M || (f(menv) && (self.prv == PRV_S || f(senv)))
+                };
+                if rd != 0 {
+                    return Err(illegal);
+                }
+                let addr = a & !63;
+                // blocked by menvcfg/senvcfg: QEMU reports mtval = 0 for this trap
+                let blocked = Ex::Trap(ILLEGAL, 0);
+                match imm {
+                    0 if allowed(3 << 4, true) => {
+                        self.translate(bus, addr, Access::Store)?; // permission check only
+                    }
+                    1 | 2 if allowed(1 << 6, true) => {
+                        self.translate(bus, addr, Access::Load)?;
+                    }
+                    4 if allowed(1 << 7, true) => {
+                        for k in 0..8 {
+                            self.store(bus, addr + 8 * k, 8, 0)?;
+                        }
+                    }
+                    0 | 1 | 2 | 4 => return Err(blocked),
+                    _ => return Err(illegal),
+                }
             }
             0x0f => {} // FENCE / FENCE.I: nothing to do on a single hart without caches
             0x07 | 0x27 | 0x43 | 0x47 | 0x4b | 0x4f | 0x53 => self.fp(bus, i, op, rd, rs1, rs2, f3)?,
@@ -984,12 +1190,18 @@ impl Riscv64 {
                             self.recheck = true;
                         }
                     }
-                    (0x09, _, 0) => {
-                        // SFENCE.VMA
+                    (0x09, _, 0) | (0x0b, _, 0) => {
+                        // SFENCE.VMA / SINVAL.VMA (Svinval)
                         if self.prv == PRV_U || (self.prv == PRV_S && self.csr[MSTATUS] & MS_TVM != 0) {
                             return Err(illegal);
                         }
                         self.flush_tlb();
+                    }
+                    (0x0c, 0 | 1, 0) if rd == 0 && rs1 == 0 => {
+                        // SFENCE.W.INVAL / SFENCE.INVAL.IR (Svinval): ordering only
+                        if self.prv == PRV_U || (self.prv == PRV_S && self.csr[MSTATUS] & MS_TVM != 0) {
+                            return Err(illegal);
+                        }
                     }
                     _ => return Err(illegal),
                 }

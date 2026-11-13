@@ -499,3 +499,16 @@ fn linux_smp_riscv64() {
 fn linux_smp_aarch64() {
     linux_smp("aarch64", "arm64", "ttyAMA0");
 }
+
+/// Zba / Zbb / Zbc / Zbs / Zicond over edge-case operands (66 instruction forms).
+#[test]
+fn riscv_bitmanip_matches_qemu_system() {
+    same_as_qemu("riscv64", "rv_bitmanip.elf");
+}
+
+/// PMP (OFF/TOR/NAPOT regions, a locked region that also binds M-mode), Zicbom/Zicboz with
+/// menvcfg gating, Svinval and Sv48 translation, checked trap by trap against QEMU.
+#[test]
+fn riscv_pmp_cbo_sv48_matches_qemu_system() {
+    same_as_qemu("riscv64", "rv_ext.elf");
+}

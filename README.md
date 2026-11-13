@@ -8,6 +8,9 @@ trap delegation, Sv39 paging, the C extension, CLINT timer/software interrupts a
 a PLIC; AArch64 EL0/EL1 exceptions, exclusives and LSE atomics. Both are checked
 instruction-for-instruction against `qemu-system-*` (see [doc/v0.2.md](doc/v0.2.md)).
 
+**v0.11: ISA completion** — AArch64 FP estimates / CRC32 / AES / SHA / CASP; RISC-V Zba/Zbb/Zbc/Zbs, Zicond, Zicbom/Zicboz,
+Svinval, Sv48 and enforced PMP; all checked against QEMU ([doc/v0.11.md](doc/v0.11.md)).
+
 **v0.10: SMP** — `-smp N` (1–8 CPUs) on both architectures: round-robin scheduling, SBI HSM/IPI/RFENCE, multi-CPU GICv2,
 PSCI `CPU_ON`; Linux and xv6 run on several CPUs ([doc/v0.10.md](doc/v0.10.md)).
 
