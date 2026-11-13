@@ -17,7 +17,9 @@ for a in riscv64 arm64; do
     [ -s "tests/guest/out/linux/root/$a/root.ext4" ] || tools/linux/mkroot.sh "$a"
 done
 
+tools/linux/fetch-busybox.sh
+
 echo "== Linux tests (boot, ext4 reboot, SMP, network; both architectures)"
-cargo test --release -- --ignored --test-threads=2
+cargo test --release -- --ignored --test-threads=2   # also user-mode busybox
 
 echo "ALL OK"

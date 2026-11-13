@@ -5,10 +5,11 @@ use ruvm::{demo, is_linux_image, Arch, LinuxBoot, Machine, Stop};
 use std::process::exit;
 
 const USAGE: &str = "\
-ruvm 1.0 — a tiny QEMU-like emulator (RISC-V 64 / AArch64)
+ruvm 1.1 — a tiny QEMU-like emulator (RISC-V 64 / AArch64)
 
 USAGE:
     ruvm -M <riscv64|aarch64> (-kernel <file> | -demo hello) [options]
+    ruvm [-M <arch>] -user <static-elf> [args...]       run one Linux program (like qemu-user / spike pk)
 
 OPTIONS:
     -M, -machine, --arch <arch>   riscv64 | aarch64   (aliases: rv64, arm64, arm)
@@ -18,6 +19,10 @@ OPTIONS:
     -bios <file|none>             firmware run before a Linux Image (e.g. OpenSBI fw_dynamic.bin);
                                   default: ruvm's built-in SBI starts the kernel in S-mode
     -dumpdtb <file>               write the generated device tree and exit
+    -user <elf> [args...]         user-mode emulation: run a static Linux ELF directly; its system calls are
+                                  served by the host (files, stdio, time, mmap/brk, ...). The architecture is
+                                  taken from the ELF. Everything after the file name goes to the program.
+                                  No threads, fork/exec, signals or dynamic linking. -m sets memory (default 1024)
     -demo <name>                  built-in demo program: hello
     -m <MiB>                      RAM size in MiB (default 128)
     -drive file=<img>[,...]       raw disk image as virtio-mmio block device (writes go to the file)
@@ -55,6 +60,8 @@ fn die(msg: &str) -> ! {
 fn main() {
     let mut args = std::env::args().skip(1);
     let (mut arch, mut kernel, mut demo_name) = (None, None, None);
+    let mut user: Option<(String, Vec<String>)> = None;
+    let mut ram_set = false;
     let mut drives: Vec<String> = Vec::new();
     let (mut rng, mut rng_seed, mut rtc, mut no_reboot) = (false, None, None, false);
     let mut nic: Option<(Vec<HostFwd>, [u8; 6])> = None;
@@ -71,6 +78,10 @@ fn main() {
                 let v = val("-M");
                 arch = Some(Arch::parse(&v).unwrap_or_else(|| die(&format!("unknown machine '{v}'"))));
             }
+            "-user" | "--user" => {
+                let prog = val("-user");
+                user = Some((prog, args.by_ref().collect()));
+            }
             "-kernel" | "--kernel" => kernel = Some(val("-kernel")),
             "-demo" | "--demo" => demo_name = Some(val("-demo")),
             "-drive" | "-hda" | "--disk" => {
@@ -79,7 +90,10 @@ fn main() {
                 let file = v.split(',').find_map(|kv| kv.strip_prefix("file=")).unwrap_or(&v).to_string();
                 drives.push(file);
             }
-            "-m" => ram = val("-m").parse().unwrap_or_else(|_| die("-m expects a number of MiB")),
+            "-m" => {
+                ram = val("-m").parse().unwrap_or_else(|_| die("-m expects a number of MiB"));
+                ram_set = true;
+            }
             "-icount" => icount = Some(val("-icount").parse().unwrap_or_else(|_| die("bad -icount"))),
             "-d" | "--trace" => trace = true,
             "-regs" => regs = true,
@@ -144,6 +158,34 @@ fn main() {
                 return;
             }
             other => die(&format!("unknown option '{other}' (try --help)")),
+        }
+    }
+
+    if let Some((prog, pargs)) = user {
+        let data = std::fs::read(&prog).unwrap_or_else(|e| die(&format!("cannot read {prog}: {e}")));
+        let detected = match data.get(18..20) {
+            Some([243, 0]) => Some(Arch::Riscv64),
+            Some([183, 0]) => Some(Arch::Aarch64),
+            _ => None,
+        };
+        let arch = arch.or(detected).unwrap_or_else(|| die("-user needs an ELF64 RISC-V or AArch64 executable"));
+        let mut vm = Machine::with_cpus(arch, 1, false, 1);
+        let argv: Vec<String> = std::iter::once(prog.clone()).chain(pargs).collect();
+        let envp: Vec<String> = std::env::vars().map(|(k, v)| format!("{k}={v}")).collect();
+        vm.trace = trace;
+        vm.load_user(&prog, &data, &argv, &envp, if ram_set { ram } else { 1024 }).unwrap_or_else(|e| die(&e));
+        let stop = vm.run(icount);
+        if regs || matches!(stop, Stop::Fatal(_)) {
+            eprintln!("--- {} registers ---\n{}", vm.cpu().name(), vm.cpu().dump());
+        }
+        match stop {
+            Stop::Halt(code) => exit(code),
+            Stop::Limit => die("instruction limit reached"),
+            Stop::Fatal(msg) => {
+                eprintln!("ruvm: fatal: {msg}");
+                exit(1)
+            }
+            Stop::Reset => exit(0),
         }
     }
 

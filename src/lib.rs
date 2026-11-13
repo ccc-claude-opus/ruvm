@@ -6,6 +6,7 @@
 //!   devices  UART (16550 / PL011), SiFive test finisher, CLINT, PLIC
 //!   cpu      instruction-set interpreters (riscv64, aarch64)
 //!   host     "semihosting" syscalls (exit / write)
+//!   linux    user-mode emulation: run a static Linux ELF with host-served syscalls
 //!   virtio   virtio-mmio transport + block / entropy / network back-ends
 //!   net      user-mode network stack (ARP, DHCP, ICMP, UDP, TCP proxy, port forwarding)
 //!   machine  glues CPU + bus together, loads ELF / raw images
@@ -17,6 +18,7 @@ pub mod devices;
 pub mod fdt;
 pub mod gic;
 pub mod host;
+pub mod linux;
 pub mod machine;
 pub mod net;
 pub mod virtio;

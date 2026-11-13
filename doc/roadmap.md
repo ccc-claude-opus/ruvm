@@ -15,6 +15,7 @@ flowchart LR
     v09 --> v10["v0.10<br/>SMP"]
     v10 --> v11["v0.11<br/>指令集補完"]
     v11 --> v10f["v1.0<br/>整合"]
+    v10f --> v11u["v1.1<br/>-user"]
 ```
 
 | 版本 | 內容 | 文件 |
@@ -31,6 +32,7 @@ flowchart LR
 | v0.10 | SMP，最多 8 核 | [v0.10](v0.10.md) |
 | v0.11 | FP 估計、CRC32、AES、SHA、CASP；RISC-V B、Zicond、Zicbo*、Svinval、Sv48、PMP | [v0.11](v0.11.md) |
 | v1.0 | CI 腳本、清理、文件 | [v1.0](v1.0.md) |
+| v1.1 | 使用者模式 `-user`：直接執行靜態 Linux ELF | [v1.1](v1.1.md) |
 
 ## 1.0 之後
 
@@ -38,3 +40,4 @@ flowchart LR
 2. **指令集**：RISC-V V、H；ARM EL2、SVE、PAuth。
 3. **裝置**：GICv3、PCI、virtio-gpu / input、9p。
 4. **真正的多執行緒 SMP**。
+5. `-user` 的 `clone`/`fork`/`execve`、訊號、動態連結（載入 ld.so）。

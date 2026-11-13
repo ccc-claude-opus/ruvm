@@ -323,6 +323,10 @@ impl Aarch64 {
         }
     }
 
+    pub fn set_sp(&mut self, sp: u64) {
+        self.sp = sp;
+    }
+
     pub fn new(id: usize) -> Self {
         Aarch64 {
             x: [0; 31],
@@ -997,7 +1001,13 @@ impl Aarch64 {
             if self.sysreg(SYS_VBAR_EL1) != 0 {
                 return Err(Ex::sync(EC_SVC64, (i >> 5) & 0xffff, None, true));
             }
-            match host::syscall(bus, self.x[8], [self.x[0], self.x[1], self.x[2]]) {
+            let r = if bus.user.is_some() {
+                let a = [self.x[0], self.x[1], self.x[2], self.x[3], self.x[4], self.x[5]];
+                crate::linux::syscall(bus, self.x[8], a)
+            } else {
+                host::syscall(bus, self.x[8], [self.x[0], self.x[1], self.x[2]])
+            };
+            match r {
                 Host::Exit(c) => return Err(Stop::Halt(c).into()),
                 Host::Ret(v) => self.x[0] = v,
             }

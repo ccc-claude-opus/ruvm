@@ -512,3 +512,61 @@ fn riscv_bitmanip_matches_qemu_system() {
 fn riscv_pmp_cbo_sv48_matches_qemu_system() {
     same_as_qemu("riscv64", "rv_ext.elf");
 }
+
+// ---------------------------------------------------------------- user-mode emulation (-user)
+
+fn run_user(prog: &str, args: &[&str], stdin: &[u8]) -> (i32, String) {
+    use std::io::Write;
+    use std::process::Stdio;
+    let path = format!("{}/{}", env!("CARGO_MANIFEST_DIR"), prog);
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ruvm"))
+        .arg("-user")
+        .arg(&path)
+        .args(args)
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(stdin).unwrap();
+    let out = child.wait_with_output().unwrap();
+    (out.status.code().unwrap_or(-1), String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// A freestanding program using raw syscalls: argv/auxv, brk, mmap, FP, files, uname, clock, ENOSYS, exit code.
+#[test]
+fn user_mode_freestanding_program() {
+    for (elf, machine) in [("user_rv.elf", "riscv64"), ("user_a64.elf", "aarch64")] {
+        let (code, out) = run_user(&format!("tests/guest/prebuilt/{elf}"), &["one", "two words"], b"");
+        assert_eq!(code, 3, "{elf}:\n{out}");
+        let want = format!(
+            "hello from user mode\nargc=3\narg: one\narg: two words\npagesz=4096\nrandom=1\nbrk grew=12288\n\
+             mmap sum=34359607296\nmunmap=0\nsqrt2 * 1e9=1414213562\nmagic: ELF\nopen missing=-2\n\
+             sysname: Linux\nmachine: {machine}\nclock ok=1\nunknown syscall=-38\n"
+        );
+        assert_eq!(out, want, "{elf}");
+    }
+}
+
+/// Real glibc-static programs (Debian's busybox): file I/O, pipes, sorting, hashing.
+/// Needs `tools/linux/fetch-busybox.sh`.
+#[test]
+#[ignore]
+fn user_mode_busybox() {
+    for arch in ["riscv64", "arm64"] {
+        let bb = format!("tests/guest/out/user/{arch}/busybox");
+        let (c, o) = run_user(&bb, &["echo", "hello", "busybox"], b"");
+        assert_eq!((c, o.as_str()), (0, "hello busybox\n"), "{arch}");
+        let (c, o) = run_user(&bb, &["tr", "a-z", "A-Z"], b"x y z\n");
+        assert_eq!((c, o.as_str()), (0, "X Y Z\n"), "{arch}");
+        let (c, o) = run_user(&bb, &["sha256sum", "Cargo.toml"], b"");
+        assert_eq!(c, 0, "{arch}");
+        let sum = Command::new("shasum").args(["-a", "256", "Cargo.toml"]).current_dir(env!("CARGO_MANIFEST_DIR")).output().unwrap();
+        assert_eq!(o.split_whitespace().next(), String::from_utf8_lossy(&sum.stdout).split_whitespace().next(), "{arch}");
+        let (c, o) = run_user(&bb, &["uname", "-m"], b"");
+        assert_eq!((c, o.trim()), (0, if arch == "arm64" { "aarch64" } else { "riscv64" }));
+        let (c, _) = run_user(&bb, &["false"], b"");
+        assert_eq!(c, 1, "{arch}");
+    }
+}

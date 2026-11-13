@@ -1,0 +1,823 @@
+//! User-mode emulation ("proxy kernel"): run one static Linux ELF directly, like `spike pk`
+//! or `qemu-user`. The guest runs without an OS; its Linux system calls (`ecall` / `svc #0`)
+//! are served here by the host. RISC-V and AArch64 share the asm-generic syscall table.
+//!
+//! Memory is one flat region starting at address 0: the program at its link addresses,
+//! `brk` heap above it, `mmap` regions growing down from below the stack, and the stack at the top.
+//! Not supported: threads/`clone`/`fork`/`exec`, signals, dynamic linking, mapping of files shared with the guest.
+
+use crate::bus::Bus;
+use crate::machine::Arch;
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
+use std::path::PathBuf;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+
+const PAGE: u64 = 4096;
+const STACK_SIZE: u64 = 8 << 20;
+const STACK_GAP: u64 = 8 << 20; // unused space between the stack and the mmap area
+
+enum Fd {
+    Stdin,
+    Stdout,
+    Stderr,
+    File(File),
+    Dir(PathBuf, Vec<(String, u8, u64)>, usize),
+}
+
+pub struct LinuxUser {
+    arch: Arch,
+    exe: String,
+    brk_start: u64,
+    brk: u64,
+    mmap_next: u64,
+    free: Vec<(u64, u64)>,
+    fds: Vec<Option<Fd>>,
+    rng: u64,
+    start: Instant,
+    /// Print every system call to stderr (`RUVM_STRACE=1`).
+    strace: bool,
+}
+
+/// What a system call did.
+pub enum Sys {
+    Ret(i64),
+    Exit(i32),
+}
+
+/// Serve a system call for the CPU: a `host::Host` result (exit, or the return value).
+pub fn syscall(bus: &mut Bus, nr: u64, args: [u64; 6]) -> crate::host::Host {
+    let mut u = bus.user.take().expect("user-mode state");
+    let r = u.syscall(bus, nr, args);
+    if u.strace {
+        match &r {
+            Sys::Ret(v) => eprintln!("syscall {nr}({:#x}, {:#x}, {:#x}, {:#x}) = {v}", args[0], args[1], args[2], args[3]),
+            Sys::Exit(c) => eprintln!("syscall {nr}({:#x}) exit {c}", args[0]),
+        }
+    }
+    bus.user = Some(u);
+    match r {
+        Sys::Ret(v) => crate::host::Host::Ret(v as u64),
+        Sys::Exit(c) => crate::host::Host::Exit(c),
+    }
+}
+
+fn align_up(v: u64) -> u64 {
+    (v + PAGE - 1) & !(PAGE - 1)
+}
+
+fn errno(e: &std::io::Error) -> i64 {
+    -(match e.raw_os_error() {
+        Some(35) => 11, // EAGAIN
+        Some(62) => 40, // ELOOP
+        Some(63) => 36, // ENAMETOOLONG
+        Some(66) => 39, // ENOTEMPTY
+        Some(n) if (1..=34).contains(&n) => n as i64,
+        _ => match e.kind() {
+            std::io::ErrorKind::NotFound => 2,
+            std::io::ErrorKind::PermissionDenied => 13,
+            std::io::ErrorKind::AlreadyExists => 17,
+            std::io::ErrorKind::InvalidInput => 22,
+            _ => 5,
+        },
+    })
+}
+
+const EBADF: i64 = -9;
+const ENOMEM: i64 = -12;
+const EFAULT: i64 = -14;
+const EINVAL: i64 = -22;
+const ENOTTY: i64 = -25;
+const ENOSYS: i64 = -38;
+
+impl LinuxUser {
+    pub fn new(arch: Arch, exe: &str, brk_start: u64, stack_low: u64) -> Self {
+        let seed = SystemTime::now().duration_since(UNIX_EPOCH).map_or(1, |d| d.as_nanos() as u64);
+        LinuxUser {
+            arch,
+            exe: std::fs::canonicalize(exe).map_or_else(|_| exe.to_string(), |p| p.to_string_lossy().into_owned()),
+            brk_start,
+            brk: brk_start,
+            mmap_next: stack_low,
+            free: Vec::new(),
+            fds: vec![Some(Fd::Stdin), Some(Fd::Stdout), Some(Fd::Stderr)],
+            rng: seed | 1,
+            start: Instant::now(),
+            strace: std::env::var_os("RUVM_STRACE").is_some(),
+        }
+    }
+
+    fn rand(&mut self) -> u64 {
+        self.rng ^= self.rng << 13;
+        self.rng ^= self.rng >> 7;
+        self.rng ^= self.rng << 17;
+        self.rng
+    }
+
+    fn alloc_fd(&mut self, fd: Fd) -> i64 {
+        match self.fds.iter().position(|f| f.is_none()) {
+            Some(i) => {
+                self.fds[i] = Some(fd);
+                i as i64
+            }
+            None => {
+                self.fds.push(Some(fd));
+                self.fds.len() as i64 - 1
+            }
+        }
+    }
+
+    /// Reserve `len` bytes (page multiple) of zeroed memory.
+    fn alloc(&mut self, bus: &mut Bus, len: u64) -> Option<u64> {
+        if let Some(i) = self.free.iter().position(|&(_, l)| l >= len) {
+            let (a, l) = self.free[i];
+            if l == len {
+                self.free.remove(i);
+            } else {
+                self.free[i] = (a + len, l - len);
+            }
+            bus.guest_bytes_mut(a, len as usize)?.fill(0);
+            return Some(a);
+        }
+        let a = self.mmap_next.checked_sub(len)?;
+        if a < self.brk + PAGE {
+            return None;
+        }
+        self.mmap_next = a;
+        Some(a)
+    }
+
+    fn release(&mut self, addr: u64, len: u64) {
+        self.free.push((addr, len));
+        while let Some(i) = self.free.iter().position(|&(a, _)| a == self.mmap_next) {
+            self.mmap_next += self.free.remove(i).1;
+        }
+    }
+
+    fn cstr(bus: &Bus, mut addr: u64) -> Option<String> {
+        let mut v = Vec::new();
+        loop {
+            let b = *bus.guest_bytes(addr, 1)?.first()?;
+            if b == 0 {
+                return Some(String::from_utf8_lossy(&v).into_owned());
+            }
+            v.push(b);
+            addr += 1;
+            if v.len() > 4096 {
+                return None;
+            }
+        }
+    }
+
+    fn path(&self, bus: &Bus, dirfd: i64, p: u64) -> Result<PathBuf, i64> {
+        let s = Self::cstr(bus, p).ok_or(EFAULT)?;
+        let path = PathBuf::from(s);
+        if path.is_absolute() || dirfd == -100 {
+            return Ok(path);
+        }
+        match self.fds.get(dirfd as usize) {
+            Some(Some(Fd::Dir(d, _, _))) => Ok(d.join(path)),
+            _ => Err(EBADF),
+        }
+    }
+
+    fn stat(&self, bus: &mut Bus, md: &std::fs::Metadata, out: u64) -> i64 {
+        let mut b = [0u8; 128];
+        let put64 = |b: &mut [u8; 128], o: usize, v: u64| b[o..o + 8].copy_from_slice(&v.to_le_bytes());
+        let put32 = |b: &mut [u8; 128], o: usize, v: u32| b[o..o + 4].copy_from_slice(&v.to_le_bytes());
+        put64(&mut b, 0, md.dev());
+        put64(&mut b, 8, md.ino());
+        put32(&mut b, 16, md.mode());
+        put32(&mut b, 20, md.nlink() as u32);
+        put32(&mut b, 24, md.uid());
+        put32(&mut b, 28, md.gid());
+        put64(&mut b, 32, md.rdev());
+        put64(&mut b, 48, md.size());
+        put32(&mut b, 56, md.blksize() as u32);
+        put64(&mut b, 64, md.blocks());
+        put64(&mut b, 72, md.atime() as u64);
+        put64(&mut b, 80, md.atime_nsec() as u64);
+        put64(&mut b, 88, md.mtime() as u64);
+        put64(&mut b, 96, md.mtime_nsec() as u64);
+        put64(&mut b, 104, md.ctime() as u64);
+        put64(&mut b, 112, md.ctime_nsec() as u64);
+        match bus.guest_bytes_mut(out, 128) {
+            Some(d) => {
+                d.copy_from_slice(&b);
+                0
+            }
+            None => EFAULT,
+        }
+    }
+
+    fn stat_tty(&self, bus: &mut Bus, out: u64) -> i64 {
+        let mut b = [0u8; 128];
+        b[16..20].copy_from_slice(&0o20620u32.to_le_bytes()); // S_IFCHR | 0620
+        b[20..24].copy_from_slice(&1u32.to_le_bytes());
+        b[56..60].copy_from_slice(&1024u32.to_le_bytes());
+        match bus.guest_bytes_mut(out, 128) {
+            Some(d) => {
+                d.copy_from_slice(&b);
+                0
+            }
+            None => EFAULT,
+        }
+    }
+
+    fn put(bus: &mut Bus, addr: u64, data: &[u8]) -> i64 {
+        match bus.guest_bytes_mut(addr, data.len()) {
+            Some(d) => {
+                d.copy_from_slice(data);
+                0
+            }
+            None => EFAULT,
+        }
+    }
+
+    /// Copy to guest memory; the byte count on success.
+    fn put_n(bus: &mut Bus, addr: u64, data: &[u8]) -> i64 {
+        match Self::put(bus, addr, data) {
+            0 => data.len() as i64,
+            e => e,
+        }
+    }
+
+    fn write_fd(&mut self, fd: usize, data: &[u8], at: Option<u64>) -> i64 {
+        let r = match self.fds.get_mut(fd) {
+            Some(Some(Fd::Stdout)) => {
+                let mut o = std::io::stdout().lock();
+                o.write_all(data).and_then(|_| o.flush()).map(|_| data.len())
+            }
+            Some(Some(Fd::Stderr)) => std::io::stderr().write_all(data).map(|_| data.len()),
+            Some(Some(Fd::File(f))) => match at {
+                Some(off) => f.write_at(data, off),
+                None => f.write(data),
+            },
+            Some(Some(Fd::Dir(..))) => return -21, // EISDIR
+            _ => return EBADF,
+        };
+        r.map_or_else(|e| errno(&e), |n| n as i64)
+    }
+
+    fn read_fd(&mut self, fd: usize, buf: &mut [u8], at: Option<u64>) -> i64 {
+        let r = match self.fds.get_mut(fd) {
+            Some(Some(Fd::Stdin)) => std::io::stdin().read(buf),
+            Some(Some(Fd::File(f))) => match at {
+                Some(off) => f.read_at(buf, off),
+                None => f.read(buf),
+            },
+            Some(Some(Fd::Dir(..))) => return -21,
+            _ => return EBADF,
+        };
+        r.map_or_else(|e| errno(&e), |n| n as i64)
+    }
+
+    fn sys_openat(&mut self, bus: &mut Bus, a: [u64; 6]) -> i64 {
+        let path = match self.path(bus, a[0] as i64, a[1]) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        let flags = a[2];
+        let (acc, creat, excl, trunc, append) = (flags & 3, flags & 0o100 != 0, flags & 0o200 != 0, flags & 0o1000 != 0, flags & 0o2000 != 0);
+        let dir_flag = if self.arch == Arch::Aarch64 { 0o40000 } else { 0o200000 };
+        if path == std::path::Path::new("/proc/self/exe") {
+            return match File::open(&self.exe) {
+                Ok(f) => self.alloc_fd(Fd::File(f)),
+                Err(e) => errno(&e),
+            };
+        }
+        if path.is_dir() && (acc == 0 || flags & dir_flag != 0) {
+            let mut ents = vec![(".".to_string(), 4u8, 0u64), ("..".to_string(), 4, 0)];
+            match std::fs::read_dir(&path) {
+                Ok(rd) => {
+                    for e in rd.flatten() {
+                        let ty = e.file_type().map_or(0, |t| if t.is_dir() { 4 } else if t.is_symlink() { 10 } else { 8 });
+                        ents.push((e.file_name().to_string_lossy().into_owned(), ty, e.metadata().map_or(0, |m| m.ino())));
+                    }
+                }
+                Err(e) => return errno(&e),
+            }
+            return self.alloc_fd(Fd::Dir(path, ents, 0));
+        }
+        let mut o = OpenOptions::new();
+        match acc {
+            0 => o.read(true),
+            1 => o.write(true),
+            _ => o.read(true).write(true),
+        };
+        if append {
+            o.append(true);
+        }
+        if trunc {
+            o.truncate(true);
+        }
+        if creat && excl {
+            o.create_new(true);
+        } else if creat {
+            o.create(true);
+        }
+        o.mode(a[3] as u32 & 0o7777);
+        match o.open(&path) {
+            Ok(f) => self.alloc_fd(Fd::File(f)),
+            Err(e) => errno(&e),
+        }
+    }
+
+    fn sys_mmap(&mut self, bus: &mut Bus, a: [u64; 6]) -> i64 {
+        let (addr, len, flags, fd, off) = (a[0], align_up(a[1]), a[3], a[4] as i64, a[5]);
+        if len == 0 {
+            return EINVAL;
+        }
+        let fixed = flags & 0x10 != 0;
+        let anon = flags & 0x20 != 0;
+        let at = if fixed {
+            if addr % PAGE != 0 || bus.guest_bytes(addr, len as usize).is_none() {
+                return ENOMEM;
+            }
+            bus.guest_bytes_mut(addr, len as usize).unwrap().fill(0);
+            addr
+        } else {
+            match self.alloc(bus, len) {
+                Some(p) => p,
+                None => return ENOMEM,
+            }
+        };
+        if !anon {
+            let mut data = vec![0u8; len as usize];
+            let n = match self.fds.get(fd as usize) {
+                Some(Some(Fd::File(f))) => f.read_at(&mut data, off).unwrap_or(0),
+                _ => return EBADF,
+            };
+            bus.guest_bytes_mut(at, n).unwrap().copy_from_slice(&data[..n]);
+        }
+        at as i64
+    }
+
+    fn sys_getdents(&mut self, bus: &mut Bus, fd: usize, buf: u64, cap: u64) -> i64 {
+        let Some(Some(Fd::Dir(_, ents, pos))) = self.fds.get_mut(fd) else { return EBADF };
+        let mut out = Vec::new();
+        while *pos < ents.len() {
+            let (name, ty, ino) = &ents[*pos];
+            let reclen = (19 + name.len() + 1 + 7) & !7;
+            if out.len() + reclen > cap as usize {
+                break;
+            }
+            let start = out.len();
+            out.extend_from_slice(&ino.to_le_bytes());
+            out.extend_from_slice(&((*pos + 1) as u64).to_le_bytes());
+            out.extend_from_slice(&(reclen as u16).to_le_bytes());
+            out.push(*ty);
+            out.extend_from_slice(name.as_bytes());
+            out.resize(start + reclen, 0);
+            *pos += 1;
+        }
+        if out.is_empty() && *pos < ents.len() {
+            return EINVAL;
+        }
+        match Self::put(bus, buf, &out) {
+            0 => out.len() as i64,
+            e => e,
+        }
+    }
+
+    pub fn syscall(&mut self, bus: &mut Bus, nr: u64, a: [u64; 6]) -> Sys {
+        let r = match nr {
+            93 | 94 => return Sys::Exit(a[0] as i32),
+            // read / write / readv / writev / pread / pwrite
+            63 | 67 => {
+                let mut buf = vec![0u8; a[2].min(1 << 24) as usize];
+                let n = self.read_fd(a[0] as usize, &mut buf, (nr == 67).then_some(a[3]));
+                if n > 0 { Self::put_n(bus, a[1], &buf[..n as usize]) } else { n }
+            }
+            64 | 68 => match bus.guest_bytes(a[1], a[2] as usize) {
+                Some(d) => {
+                    let d = d.to_vec();
+                    self.write_fd(a[0] as usize, &d, (nr == 68).then_some(a[3]))
+                }
+                None => EFAULT,
+            },
+            65 | 66 => {
+                let mut total = 0i64;
+                for k in 0..a[2] {
+                    let (Some(base), Some(len)) = (bus.guest_bytes(a[1] + k * 16, 8), bus.guest_bytes(a[1] + k * 16 + 8, 8)) else { return Sys::Ret(EFAULT) };
+                    let (base, len) = (u64::from_le_bytes(base.try_into().unwrap()), u64::from_le_bytes(len.try_into().unwrap()));
+                    let n = if nr == 66 {
+                        match bus.guest_bytes(base, len as usize) {
+                            Some(d) => {
+                                let d = d.to_vec();
+                                self.write_fd(a[0] as usize, &d, None)
+                            }
+                            None => EFAULT,
+                        }
+                    } else {
+                        let mut buf = vec![0u8; len as usize];
+                        let n = self.read_fd(a[0] as usize, &mut buf, None);
+                        if n > 0 { Self::put_n(bus, base, &buf[..n as usize]) } else { n }
+                    };
+                    if n < 0 {
+                        if total == 0 {
+                            total = n;
+                        }
+                        break;
+                    }
+                    total += n;
+                    if (n as u64) < len {
+                        break;
+                    }
+                }
+                total
+            }
+            56 => self.sys_openat(bus, a),
+            57 => match self.fds.get_mut(a[0] as usize) {
+                Some(f @ Some(_)) if a[0] > 2 => {
+                    *f = None;
+                    0
+                }
+                Some(Some(_)) => 0,
+                _ => EBADF,
+            },
+            23 | 24 | 1031 => {
+                // dup / dup3: only files can be duplicated
+                match self.fds.get(a[0] as usize) {
+                    Some(Some(Fd::File(f))) => match f.try_clone() {
+                        Ok(c) => {
+                            if nr == 24 {
+                                let t = a[1] as usize;
+                                while self.fds.len() <= t {
+                                    self.fds.push(None);
+                                }
+                                self.fds[t] = Some(Fd::File(c));
+                                t as i64
+                            } else {
+                                self.alloc_fd(Fd::File(c))
+                            }
+                        }
+                        Err(e) => errno(&e),
+                    },
+                    Some(Some(_)) if nr == 24 => {
+                        let (src, t) = (a[0] as usize, a[1] as usize);
+                        let dup = match self.fds[src] {
+                            Some(Fd::Stdin) => Fd::Stdin,
+                            Some(Fd::Stdout) => Fd::Stdout,
+                            _ => Fd::Stderr,
+                        };
+                        while self.fds.len() <= t {
+                            self.fds.push(None);
+                        }
+                        self.fds[t] = Some(dup);
+                        t as i64
+                    }
+                    _ => EBADF,
+                }
+            }
+            25 => match a[1] {
+                0 | 1030 => EINVAL,
+                1 | 2 | 3 | 4 => 0,
+                _ => EINVAL,
+            },
+            62 => match self.fds.get_mut(a[0] as usize) {
+                Some(Some(Fd::File(f))) => {
+                    let pos = match a[2] {
+                        0 => SeekFrom::Start(a[1]),
+                        1 => SeekFrom::Current(a[1] as i64),
+                        _ => SeekFrom::End(a[1] as i64),
+                    };
+                    f.seek(pos).map_or_else(|e| errno(&e), |p| p as i64)
+                }
+                Some(Some(_)) => -29, // ESPIPE
+                _ => EBADF,
+            },
+            61 => self.sys_getdents(bus, a[0] as usize, a[1], a[2]),
+            79 => {
+                // newfstatat(dirfd, path, stat, flags)
+                let empty = Self::cstr(bus, a[1]).is_some_and(|s| s.is_empty()) && a[3] & 0x1000 != 0;
+                if empty {
+                    return Sys::Ret(self.sys_fstat(bus, a[0] as usize, a[2]));
+                }
+                match self.path(bus, a[0] as i64, a[1]) {
+                    Ok(p) => {
+                        let md = if a[3] & 0x100 != 0 { std::fs::symlink_metadata(&p) } else { std::fs::metadata(&p) };
+                        md.map_or_else(|e| errno(&e), |m| self.stat(bus, &m, a[2]))
+                    }
+                    Err(e) => e,
+                }
+            }
+            80 => self.sys_fstat(bus, a[0] as usize, a[1]),
+            48 | 439 => match self.path(bus, a[0] as i64, a[1]) {
+                Ok(p) => std::fs::metadata(&p).map_or_else(|e| errno(&e), |_| 0),
+                Err(e) => e,
+            },
+            17 => {
+                let cwd = std::env::current_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| "/".into());
+                let mut b = cwd.into_bytes();
+                b.push(0);
+                if b.len() as u64 > a[1] {
+                    -34 // ERANGE
+                } else {
+                    match Self::put(bus, a[0], &b) {
+                        0 => b.len() as i64,
+                        e => e,
+                    }
+                }
+            }
+            34 => match self.path(bus, a[0] as i64, a[1]) {
+                Ok(p) => std::fs::create_dir(&p).map_or_else(|e| errno(&e), |_| 0),
+                Err(e) => e,
+            },
+            35 => match self.path(bus, a[0] as i64, a[1]) {
+                Ok(p) => (if a[2] & 0x200 != 0 { std::fs::remove_dir(&p) } else { std::fs::remove_file(&p) }).map_or_else(|e| errno(&e), |_| 0),
+                Err(e) => e,
+            },
+            78 => match self.path(bus, a[0] as i64, a[1]) {
+                Ok(p) => {
+                    let t = if p == std::path::Path::new("/proc/self/exe") { Ok(PathBuf::from(&self.exe)) } else { std::fs::read_link(&p) };
+                    match t {
+                        Ok(t) => {
+                            let b = t.to_string_lossy().into_owned().into_bytes();
+                            let n = b.len().min(a[3] as usize);
+                            match Self::put(bus, a[2], &b[..n]) {
+                                0 => n as i64,
+                                e => e,
+                            }
+                        }
+                        Err(e) => errno(&e),
+                    }
+                }
+                Err(e) => e,
+            },
+            73 => {
+                // ppoll(fds, nfds, ...): every open descriptor is always ready, closed ones are POLLNVAL
+                let mut ready = 0;
+                for k in 0..a[1] {
+                    let p = a[0] + k * 8;
+                    let Some(b) = bus.guest_bytes(p, 8) else { return Sys::Ret(EFAULT) };
+                    let fd = i32::from_le_bytes(b[..4].try_into().unwrap());
+                    let ev = i16::from_le_bytes(b[4..6].try_into().unwrap());
+                    let open = fd >= 0 && matches!(self.fds.get(fd as usize), Some(Some(_)));
+                    let rev: i16 = if open { ev & 5 } else { 0x20 };
+                    if rev != 0 {
+                        ready += 1;
+                    }
+                    bus.guest_bytes_mut(p + 6, 2).unwrap().copy_from_slice(&rev.to_le_bytes());
+                }
+                ready
+            }
+            29 => ENOTTY, // ioctl: no terminals
+            214 => {
+                let want = a[0];
+                if want >= self.brk_start && want < self.mmap_next.saturating_sub(PAGE) {
+                    if want < self.brk {
+                        if let Some(d) = bus.guest_bytes_mut(want, (self.brk - want) as usize) {
+                            d.fill(0);
+                        }
+                    }
+                    self.brk = want;
+                }
+                self.brk as i64
+            }
+            222 => self.sys_mmap(bus, a),
+            215 => {
+                let (addr, len) = (a[0], align_up(a[1]));
+                if addr % PAGE != 0 {
+                    EINVAL
+                } else {
+                    self.release(addr, len);
+                    0
+                }
+            }
+            216 => {
+                // mremap(old, old_len, new_len, flags): move to a fresh region
+                let (old, olen, nlen) = (a[0], align_up(a[1]), align_up(a[2]));
+                if nlen <= olen {
+                    old as i64
+                } else if a[3] & 1 == 0 {
+                    ENOMEM
+                } else {
+                    match self.alloc(bus, nlen) {
+                        Some(n) => {
+                            let data = bus.guest_bytes(old, olen as usize).map(|d| d.to_vec());
+                            match data {
+                                Some(d) => {
+                                    bus.guest_bytes_mut(n, d.len()).unwrap().copy_from_slice(&d);
+                                    self.release(old, olen);
+                                    n as i64
+                                }
+                                None => EFAULT,
+                            }
+                        }
+                        None => ENOMEM,
+                    }
+                }
+            }
+            226 | 233 | 135 | 134 | 132 | 99 | 100 | 167 => 0, // mprotect madvise sigprocmask sigaction sigaltstack robust_list ...
+            96 => 1,  // set_tid_address -> tid
+            98 => {
+                // futex: single thread, so a wait could never be woken
+                match a[1] & 0x7f {
+                    0 | 9 => -11, // WAIT -> EAGAIN
+                    _ => 0,
+                }
+            }
+            113 => {
+                let (s, ns) = if a[0] == 0 {
+                    let d = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+                    (d.as_secs(), d.subsec_nanos())
+                } else {
+                    let d = self.start.elapsed();
+                    (d.as_secs() + 1000, d.subsec_nanos())
+                };
+                let mut b = s.to_le_bytes().to_vec();
+                b.extend_from_slice(&(ns as u64).to_le_bytes());
+                Self::put(bus, a[1], &b)
+            }
+            169 => {
+                let d = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+                let mut b = d.as_secs().to_le_bytes().to_vec();
+                b.extend_from_slice(&(d.subsec_micros() as u64).to_le_bytes());
+                if a[0] != 0 { Self::put(bus, a[0], &b) } else { 0 }
+            }
+            101 | 115 => {
+                // nanosleep(req, rem) / clock_nanosleep(clk, flags, req, rem)
+                let req = if nr == 101 { a[0] } else { a[2] };
+                match bus.guest_bytes(req, 16) {
+                    Some(b) => {
+                        let s = u64::from_le_bytes(b[..8].try_into().unwrap());
+                        let ns = u64::from_le_bytes(b[8..].try_into().unwrap());
+                        if !(nr == 115 && a[1] & 1 != 0) {
+                            std::thread::sleep(std::time::Duration::new(s, ns.min(999_999_999) as u32));
+                        }
+                        0
+                    }
+                    None => EFAULT,
+                }
+            }
+            124 => 0,
+            160 => {
+                let mut b = vec![0u8; 65 * 6];
+                let machine = if self.arch == Arch::Riscv64 { "riscv64" } else { "aarch64" };
+                for (i, s) in ["Linux", "ruvm", "6.1.0-ruvm", "#1 ruvm", machine, "(none)"].iter().enumerate() {
+                    b[i * 65..i * 65 + s.len()].copy_from_slice(s.as_bytes());
+                }
+                Self::put(bus, a[0], &b)
+            }
+            166 => 0o22,
+            172 => 1000,
+            173 => 1,
+            174 | 175 | 176 | 177 => 1000,
+            178 => 1000,
+            261 => {
+                // prlimit64(pid, resource, new, old)
+                if a[3] != 0 {
+                    let cur = if a[1] == 3 { STACK_SIZE } else { u64::MAX };
+                    let mut b = cur.to_le_bytes().to_vec();
+                    b.extend_from_slice(&u64::MAX.to_le_bytes());
+                    Self::put(bus, a[3], &b)
+                } else {
+                    0
+                }
+            }
+            278 => {
+                let n = a[1].min(1 << 20) as usize;
+                let mut v = Vec::with_capacity(n + 8);
+                while v.len() < n {
+                    v.extend_from_slice(&self.rand().to_le_bytes());
+                }
+                v.truncate(n);
+                match Self::put(bus, a[0], &v) {
+                    0 => n as i64,
+                    e => e,
+                }
+            }
+            129 | 130 | 131 => {
+                // kill / tkill / tgkill: a fatal signal ends the program the way a shell reports it
+                let sig = if nr == 131 { a[2] } else { a[1] };
+                if sig == 0 {
+                    0
+                } else {
+                    return Sys::Exit(128 + sig as i32);
+                }
+            }
+            435 | 220 | 221 => ENOSYS, // clone3 / clone / execve: no processes
+            _ => ENOSYS,
+        };
+        Sys::Ret(r)
+    }
+
+    fn sys_fstat(&mut self, bus: &mut Bus, fd: usize, out: u64) -> i64 {
+        match self.fds.get(fd) {
+            Some(Some(Fd::Stdin | Fd::Stdout | Fd::Stderr)) => self.stat_tty(bus, out),
+            Some(Some(Fd::File(f))) => match f.metadata() {
+                Ok(m) => self.stat(bus, &m, out),
+                Err(e) => errno(&e),
+            },
+            Some(Some(Fd::Dir(p, _, _))) => match std::fs::metadata(p) {
+                Ok(m) => self.stat(bus, &m, out),
+                Err(e) => errno(&e),
+            },
+            _ => EBADF,
+        }
+    }
+}
+
+/// Program image placed in guest memory plus the initial stack.
+pub struct UserImage {
+    pub entry: u64,
+    pub sp: u64,
+}
+
+/// Load a static ELF into the bus's RAM (which starts at address 0), build the Linux process
+/// stack (argc, argv, envp, auxv) and install the system-call emulation.
+pub fn load(bus: &mut Bus, arch: Arch, exe: &str, d: &[u8], argv: &[String], envp: &[String]) -> Result<UserImage, String> {
+    let u16_at = |o: usize| d.get(o..o + 2).map_or(0, |b| u16::from_le_bytes(b.try_into().unwrap()));
+    let u32_at = |o: usize| d.get(o..o + 4).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()));
+    let u64_at = |o: usize| d.get(o..o + 8).map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
+    if d.len() < 64 || &d[..4] != b"\x7fELF" || d[4] != 2 || d[5] != 1 {
+        return Err("not a little-endian ELF64 file".into());
+    }
+    let want = if arch == Arch::Riscv64 { 243 } else { 183 };
+    if u16_at(18) != want {
+        return Err(format!("ELF e_machine {} does not match {:?}", u16_at(18), arch));
+    }
+    let bias: u64 = if u16_at(16) == 3 { 0x1000_0000 } else { 0 }; // ET_DYN (static-pie) is placed here
+    let (phoff, phentsize, phnum) = (u64_at(32) as usize, u16_at(54) as usize, u16_at(56) as usize);
+    let (mut top, mut phdr) = (0u64, 0u64);
+    for k in 0..phnum {
+        let p = phoff + k * phentsize;
+        match u32_at(p) {
+            3 => return Err("dynamically linked executables are not supported (build with -static)".into()),
+            1 => {
+                let (off, vaddr, filesz, memsz) = (u64_at(p + 8) as usize, u64_at(p + 16) + bias, u64_at(p + 32) as usize, u64_at(p + 40));
+                if off.checked_add(filesz).map_or(true, |e| e > d.len()) {
+                    return Err("truncated ELF segment".into());
+                }
+                bus.load(vaddr, &d[off..off + filesz])?;
+                top = top.max(vaddr + memsz);
+                if off <= phoff && phoff < off + filesz {
+                    phdr = vaddr + (phoff - off) as u64;
+                }
+            }
+            _ => {}
+        }
+    }
+    let ram_end = bus.ram_base() + bus.ram_size();
+    if top + STACK_SIZE + STACK_GAP + (16 << 20) > ram_end {
+        return Err("program does not fit in RAM (use -m)".into());
+    }
+    let mut sp = ram_end - 64;
+    let mut push_str = |bus: &mut Bus, s: &str| -> u64 {
+        sp -= s.len() as u64 + 1;
+        let mut b = s.as_bytes().to_vec();
+        b.push(0);
+        bus.guest_bytes_mut(sp, b.len()).unwrap().copy_from_slice(&b);
+        sp
+    };
+    let exe_ptr = push_str(bus, exe);
+    let envs: Vec<u64> = envp.iter().map(|s| push_str(bus, s)).collect();
+    let args: Vec<u64> = argv.iter().map(|s| push_str(bus, s)).collect();
+    sp &= !15;
+    let mut rnd = [0u8; 16];
+    for (i, b) in rnd.iter_mut().enumerate() {
+        *b = (0x9e37_79b9u64.wrapping_mul(i as u64 + 1) >> 7) as u8 ^ 0x5a;
+    }
+    sp -= 16;
+    bus.guest_bytes_mut(sp, 16).unwrap().copy_from_slice(&rnd);
+    let rnd_ptr = sp;
+    let hwcap: u64 = if arch == Arch::Riscv64 { 0x112d } else { 0x1fb };
+    let auxv: [(u64, u64); 14] = [
+        (3, phdr),
+        (4, phentsize as u64),
+        (5, phnum as u64),
+        (6, PAGE),
+        (7, 0),
+        (8, 0),
+        (9, u64_at(24) + bias),
+        (11, 1000),
+        (12, 1000),
+        (13, 1000),
+        (14, 1000),
+        (16, hwcap),
+        (17, 100),
+        (23, 0),
+    ];
+    let extra = [(25, rnd_ptr), (31, exe_ptr), (0, 0)];
+    let words = 1 + args.len() + 1 + envs.len() + 1 + 2 * (auxv.len() + extra.len());
+    sp -= (words as u64) * 8;
+    sp &= !15;
+    let mut w = Vec::with_capacity(words * 8);
+    let mut push = |v: u64| w.extend_from_slice(&v.to_le_bytes());
+    push(args.len() as u64);
+    args.iter().for_each(|&v| push(v));
+    push(0);
+    envs.iter().for_each(|&v| push(v));
+    push(0);
+    for (k, v) in auxv.iter().chain(extra.iter()) {
+        push(*k);
+        push(*v);
+    }
+    bus.guest_bytes_mut(sp, w.len()).unwrap().copy_from_slice(&w);
+    let stack_low = ram_end - STACK_SIZE - STACK_GAP;
+    let brk = align_up(top);
+    bus.user = Some(Box::new(LinuxUser::new(arch, exe, brk, stack_low)));
+    Ok(UserImage { entry: u64_at(24) + bias, sp })
+}

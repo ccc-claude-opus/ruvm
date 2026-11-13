@@ -568,6 +568,30 @@ impl Machine {
         }
     }
 
+    /// User-mode emulation: run a static Linux ELF directly (no kernel, no devices). RAM is
+    /// one flat region from address 0 of `ram_mb` MiB; system calls are served by the host.
+    pub fn load_user(&mut self, exe: &str, data: &[u8], argv: &[String], envp: &[String], ram_mb: usize) -> Result<(), String> {
+        let mut bus = Bus::with_cpus(0, ram_mb << 20, 1);
+        let img = crate::linux::load(&mut bus, self.arch, exe, data, argv, envp)?;
+        self.bus = bus;
+        self.ncpus = 1;
+        self.cpus = vec![match self.arch {
+            Arch::Riscv64 => Box::new(Riscv64::new(0)) as Box<dyn Cpu>,
+            Arch::Aarch64 => Box::new(Aarch64::new(0)) as Box<dyn Cpu>,
+        }];
+        self.start_cpus(img.entry);
+        match self.arch {
+            Arch::Riscv64 => {
+                let c = self.cpus[0].as_any().downcast_mut::<Riscv64>().unwrap();
+                c.set_reg(2, img.sp);
+                c.enable_fp();
+            }
+            Arch::Aarch64 => self.cpus[0].as_any().downcast_mut::<Aarch64>().unwrap().set_sp(img.sp),
+        }
+        self.boot = None;
+        Ok(())
+    }
+
     /// Load a raw binary at `addr` and start executing there.
     pub fn load_raw(&mut self, addr: u64, data: &[u8]) -> Result<(), String> {
         self.bus.load(addr, data)?;

@@ -129,6 +129,8 @@ pub struct Bus {
     pub interactive: bool,
     /// External events can arrive at any time (network): idle in real time, never skip ahead.
     pub realtime_idle: bool,
+    /// User-mode emulation state (`-user`): Linux system calls are served by the host.
+    pub user: Option<Box<crate::linux::LinuxUser>>,
 }
 
 const CLINT_SIZE: u64 = 0x1_0000;
@@ -158,6 +160,7 @@ impl Bus {
             irq_dirty: false,
             interactive: false,
             realtime_idle: false,
+            user: None,
         }
     }
 
@@ -232,6 +235,17 @@ impl Bus {
         } else {
             None
         }
+    }
+
+    /// Guest RAM bytes at `addr` (None if not entirely inside RAM).
+    pub fn guest_bytes(&self, addr: u64, len: usize) -> Option<&[u8]> {
+        let off = self.ram_off(addr, len)?;
+        Some(&self.ram[off..off + len])
+    }
+
+    pub fn guest_bytes_mut(&mut self, addr: u64, len: usize) -> Option<&mut [u8]> {
+        let off = self.ram_off(addr, len)?;
+        Some(&mut self.ram[off..off + len])
     }
 
     #[inline]

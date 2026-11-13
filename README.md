@@ -23,6 +23,9 @@ tools/linux/fetch-debian.sh && tools/linux/mkroot.sh      # Debian kernels + a s
     -append "console=ttyAMA0 rdinit=/init" -serial stdio
 ```
 
+**Run a single program** (like `spike pk` / `qemu-user`): `ruvm -user hello.elf [args]` runs a static Linux ELF, serving its
+system calls on the host (`tools/linux/fetch-busybox.sh` gives real glibc binaries to try; [doc/v1.1.md](doc/v1.1.md)).
+
 Other guests: `-demo hello`, bare ELF programs (`-kernel prog.elf`), MIT xv6-riscv
 (`-kernel tests/guest/prebuilt/xv6/kernel -drive file=tests/guest/prebuilt/xv6/fs.img -snapshot`), OpenSBI (`-bios`).
 Options: `-m MB`, `-smp N`, `-drive file=…[,…]`, `-snapshot`, `-rng`, `-rng-seed`, `-nic user[,hostfwd=tcp::H-:G]`,
@@ -41,7 +44,7 @@ Options: `-m MB`, `-smp N`, `-drive file=…[,…]`, `-snapshot`, `-rng`, `-rng-
 Devices (both boards): NS16550 / PL011 console, virtio-mmio block, rng and net (user-mode network stack: DHCP, DNS,
 ICMP, UDP, TCP, port forwarding), RTC, power-off and reboot. A device tree is generated for each board.
 
-**Not implemented**: RISC-V V and H, ARM EL2/EL3, SVE, pointer authentication, GICv3, PCI, graphics, JIT.
+**Not implemented**: RISC-V V and H, ARM EL2/EL3, SVE, pointer authentication, GICv3, PCI, graphics, JIT; in `-user` mode threads, fork/exec and signals.
 Speed is that of a plain interpreter, about 120 MIPS (see [doc/v0.8.md](doc/v0.8.md)); a Debian boot takes about a minute.
 
 ## Testing
@@ -59,6 +62,7 @@ The `#[ignore]` tests boot real Linux (they need `fetch-debian.sh` and `mkroot.s
 
 | Version | Added |
 |---|---|
+| v1.1 | user-mode emulation `-user` ([doc/v1.1.md](doc/v1.1.md)) |
 | v1.0 | consolidation: CI script, cleanup, docs ([doc/v1.0.md](doc/v1.0.md)) |
 | v0.11 | ISA completion: FP estimates, CRC32, AES, SHA, CASP; RISC-V B, Zicond, Zicbo\*, Svinval, Sv48, PMP ([doc/v0.11.md](doc/v0.11.md)) |
 | v0.10 | SMP ([doc/v0.10.md](doc/v0.10.md)) |

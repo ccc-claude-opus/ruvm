@@ -308,6 +308,11 @@ impl Riscv64 {
         self.prv
     }
 
+    /// Turn the FP unit on (mstatus.FS = Initial), as a kernel would before running user code.
+    pub fn enable_fp(&mut self) {
+        self.csr[MSTATUS] = (self.csr[MSTATUS] & !MS_FS) | (1 << 13);
+    }
+
     pub fn set_reg(&mut self, r: usize, v: u64) {
         self.set(r, v);
     }
@@ -1137,10 +1142,18 @@ impl Riscv64 {
                     (0x00, 0, 0) if rs1 == 0 => {
                         // ECALL
                         if self.prv == PRV_M && self.csr[MTVEC] == 0 {
-                            let args = [self.x[10], self.x[11], self.x[12]];
-                            match host::syscall(bus, self.x[17], args) {
-                                Host::Exit(c) => return Err(Ex::Stop(Stop::Halt(c))),
-                                Host::Ret(v) => self.x[10] = v,
+                            if bus.user.is_some() {
+                                let a = [self.x[10], self.x[11], self.x[12], self.x[13], self.x[14], self.x[15]];
+                                match crate::linux::syscall(bus, self.x[17], a) {
+                                    Host::Exit(c) => return Err(Ex::Stop(Stop::Halt(c))),
+                                    Host::Ret(v) => self.x[10] = v,
+                                }
+                            } else {
+                                let args = [self.x[10], self.x[11], self.x[12]];
+                                match host::syscall(bus, self.x[17], args) {
+                                    Host::Exit(c) => return Err(Ex::Stop(Stop::Halt(c))),
+                                    Host::Ret(v) => self.x[10] = v,
+                                }
                             }
                         } else {
                             return Err(Ex::Trap(ECALL_U + self.prv, 0));
