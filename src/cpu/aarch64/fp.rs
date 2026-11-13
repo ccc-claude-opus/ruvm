@@ -173,6 +173,119 @@ pub fn rint(f: Fmt, x: u64, rm: u8, exact: bool, dn: bool, fl: &mut u8) -> u64 {
     nan1(f, x, dn, fl).unwrap_or_else(|| sf::round_to_int(f, x, rm, exact, fl))
 }
 
+/// ARM `RecipEstimate`: 9-bit input 256..511 -> 9-bit result 256..511.
+pub fn recip_estimate(a: u32) -> u32 {
+    let a = a * 2 + 1;
+    let b = (1u32 << 19) / a;
+    (b + 1) / 2
+}
+
+/// ARM `RecipSqrtEstimate`: input 128..511 -> 256..511.
+pub fn rsqrt_estimate(a: u32) -> u32 {
+    let a = if a < 256 { a * 2 + 1 } else { (((a >> 1) << 1) + 1) * 2 };
+    let mut b = 512u64;
+    while (a as u64) * (b + 1) * (b + 1) < (1u64 << 28) {
+        b += 1;
+    }
+    ((b + 1) / 2) as u32
+}
+
+/// FRECPE (FPRecipEstimate) for single and double precision.
+pub fn frecpe(f: Fmt, x: u64, rm: u8, dn: bool, fl: &mut u8) -> u64 {
+    if let Some(n) = nan1(f, x, dn, fl) {
+        return n;
+    }
+    let (fb, eb, bias) = (sf::frac_bits(f), sf::exp_bits(f), sf::exp_bias(f) as i64);
+    let sign = x & f.sign_bit() != 0;
+    let (exp, frac) = (((x >> fb) & ((1 << eb) - 1)) as i64, x & ((1u64 << fb) - 1));
+    if sf::is_inf(f, x) {
+        return sf::zero_bits(f, sign);
+    }
+    if sf::is_zero(f, x) {
+        *fl |= sf::DZ;
+        return sf::infinity(f, sign);
+    }
+    if exp == 0 && frac >> (fb - 2) == 0 {
+        // |x| < 2^-(bias+1): the reciprocal overflows
+        *fl |= sf::OF | sf::NX;
+        let to_inf = match rm {
+            sf::RUP => !sign,
+            sf::RDN => sign,
+            sf::RTZ => false,
+            _ => true,
+        };
+        return if to_inf { sf::infinity(f, sign) } else { sf::max_finite(f, sign) };
+    }
+    let (mut e, mut fr) = (exp, frac);
+    let mask = (1u64 << fb) - 1;
+    if exp == 0 {
+        if fr >> (fb - 1) & 1 == 0 {
+            e = -1;
+            fr = (fr << 2) & mask;
+        } else {
+            fr = (fr << 1) & mask;
+        }
+    }
+    let scaled = (1u32 << 8) | (fr >> (fb - 8)) as u32;
+    let mut result_exp = (2 * bias - 1) - e;
+    let est = recip_estimate(scaled) as u64;
+    let mut out = (est & 0xff) << (fb - 8);
+    if result_exp == 0 {
+        out = (1 << (fb - 1)) | (out >> 1);
+    } else if result_exp == -1 {
+        out = (1 << (fb - 2)) | (out >> 2);
+        result_exp = 0;
+    }
+    sf::zero_bits(f, sign) | (result_exp as u64) << fb | out
+}
+
+/// FRSQRTE (FPRSqrtEstimate) for single and double precision.
+pub fn frsqrte(f: Fmt, x: u64, dn: bool, fl: &mut u8) -> u64 {
+    if let Some(n) = nan1(f, x, dn, fl) {
+        return n;
+    }
+    let (fb, eb) = (sf::frac_bits(f), sf::exp_bits(f));
+    let sign = x & f.sign_bit() != 0;
+    let (exp, frac) = (((x >> fb) & ((1 << eb) - 1)) as i64, x & ((1u64 << fb) - 1));
+    if sf::is_zero(f, x) {
+        *fl |= sf::DZ;
+        return sf::infinity(f, sign);
+    }
+    if sign {
+        *fl |= sf::NV;
+        return sf::default_nan(f);
+    }
+    if sf::is_inf(f, x) {
+        return 0;
+    }
+    let mask = (1u64 << fb) - 1;
+    let (mut e, mut fr) = (exp, frac);
+    if exp == 0 {
+        while fr >> (fb - 1) & 1 == 0 {
+            fr = (fr << 1) & mask;
+            e -= 1;
+        }
+        fr = (fr << 1) & mask;
+    }
+    let scaled = if e & 1 == 0 { (1u32 << 8) | (fr >> (fb - 8)) as u32 } else { (1u32 << 7) | (fr >> (fb - 7)) as u32 };
+    let base: i64 = if fb == 23 { 380 } else { 3068 };
+    let result_exp = (base - e) / 2;
+    let est = rsqrt_estimate(scaled) as u64;
+    (result_exp as u64) << fb | (est & 0xff) << (fb - 8)
+}
+
+/// FRECPX: reciprocal exponent (sign kept, exponent inverted, fraction cleared).
+pub fn frecpx(f: Fmt, x: u64, dn: bool, fl: &mut u8) -> u64 {
+    if let Some(n) = nan1(f, x, dn, fl) {
+        return n;
+    }
+    let (fb, eb) = (sf::frac_bits(f), sf::exp_bits(f));
+    let sign = x & f.sign_bit();
+    let exp = (x >> fb) & ((1 << eb) - 1);
+    let new = if exp == 0 { (1u64 << eb) - 2 } else { !exp & ((1 << eb) - 1) };
+    sign | new << fb
+}
+
 /// VFPExpandImm
 pub fn expand_imm(f: Fmt, imm8: u32) -> u64 {
     let (sign, b6, low) = ((imm8 >> 7) as u64, (imm8 >> 6) as u64 & 1, imm8 as u64 & 0x3f);

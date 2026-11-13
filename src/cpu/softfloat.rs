@@ -408,6 +408,30 @@ pub fn min_max(f: Fmt, a: u64, b: u64, max: bool, fl: &mut u8) -> u64 {
     }
 }
 
+pub fn frac_bits(f: Fmt) -> u32 {
+    f.frac
+}
+
+pub fn exp_bits(f: Fmt) -> u32 {
+    f.exp
+}
+
+pub fn exp_bias(f: Fmt) -> i32 {
+    f.bias()
+}
+
+pub fn infinity(f: Fmt, sign: bool) -> u64 {
+    f.inf(sign)
+}
+
+pub fn max_finite(f: Fmt, sign: bool) -> u64 {
+    f.max_finite(sign)
+}
+
+pub fn zero_bits(f: Fmt, sign: bool) -> u64 {
+    f.zero(sign)
+}
+
 pub fn is_snan(f: Fmt, x: u64) -> bool {
     unpack(f, x).1 == V::SNaN
 }

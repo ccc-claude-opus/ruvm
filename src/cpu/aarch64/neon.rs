@@ -761,6 +761,19 @@ impl Aarch64 {
                     };
                     fp::to_int(f, x, rm2, !u, bitsz, 0, &mut fl)
                 }
+                (0x1d, false, true) => fp::frecpe(f, x, rmode, dn, &mut fl),
+                (0x1d, true, true) => fp::frsqrte(f, x, dn, &mut fl),
+                (0x1f, false, true) if scalar => fp::frecpx(f, x, dn, &mut fl),
+                (0x1c, false, true) => {
+                    // URECPE: unsigned reciprocal estimate (32-bit lanes)
+                    let v = x as u32;
+                    if v >> 31 == 0 { 0xffff_ffff } else { ((fp::recip_estimate(v >> 23) & 0x1ff) << 23) as u64 }
+                }
+                (0x1c, true, true) => {
+                    // URSQRTE
+                    let v = x as u32;
+                    if v >> 30 == 0 { 0xffff_ffff } else { ((fp::rsqrt_estimate(v >> 23) & 0x1ff) << 23) as u64 }
+                }
                 (0x1d, _, false) => {
                     // SCVTF / UCVTF (integer lanes)
                     sf::from_int(f, x, !u, bitsz, rmode, &mut fl)

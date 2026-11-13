@@ -242,6 +242,9 @@ impl Aarch64 {
         let bits = |hi: u32, lo: u32| (i >> lo) & ((1 << (hi - lo + 1)) - 1);
         if b(31) == 0 && b(30) == 1 && top5 == 0b11110 || b(31) == 0 && b(30) == 1 && top5 == 0b11111 {
             // ---- Advanced SIMD scalar
+            if i & 0xffe0_8c00 == 0x5e00_0000 || i & 0xffff_0c00 == 0x5e28_0800 {
+                return self.crypto_sha(i);
+            }
             return match top5 {
                 0b11110 if b(21) == 1 && b(10) == 1 => self.simd_three_same(i, true),
                 0b11110 if bits(21, 17) == 0b10000 && bits(11, 10) == 0b10 => self.simd_two_reg(i, true),
@@ -262,6 +265,7 @@ impl Aarch64 {
                             0b00 => self.simd_three_diff(i),
                             _ if bits(21, 17) == 0b10000 => self.simd_two_reg(i, false),
                             _ if bits(21, 17) == 0b11000 => self.simd_across(i),
+                            _ if i & 0xffff_0c00 == 0x4e28_0800 => self.crypto_aes(i),
                             _ => Err(self.undef(i)),
                         }
                     } else if b(29) == 0 && b(21) == 0 && b(15) == 0 && bits(11, 10) == 0b10 {

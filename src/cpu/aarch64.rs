@@ -19,6 +19,7 @@ use crate::host::{self, Host};
 use crate::machine::Stop;
 use std::collections::HashMap;
 
+mod crypto;
 mod fp;
 mod mmu;
 mod neon;
@@ -65,7 +66,7 @@ const SYS_FPCR: u32 = sr(3, 3, 4, 4, 0);
 const SYS_FPSR: u32 = sr(3, 3, 4, 4, 1);
 
 /// ID_AA64* / ID_* register values (read-only). A Cortex-A57 r1p3-like CPU without
-/// EL2/EL3, crypto, PMU, SVE, pointer authentication or hardware A/D updates.
+/// EL2/EL3, PMU, SVE, pointer authentication or hardware A/D updates (but with AES/SHA/CRC32/LSE).
 fn id_reg(key: u32) -> Option<u64> {
     const fn r(crm: u32, op2: u32) -> u32 {
         sr(3, 0, 0, crm, op2)
@@ -73,6 +74,7 @@ fn id_reg(key: u32) -> Option<u64> {
     Some(match key {
         k if k == r(4, 0) => 0x0000_0000_0000_0011, // ID_AA64PFR0: EL0/EL1 = AArch64, FP + AdvSIMD present
         k if k == r(5, 0) => 0x0000_0000_0000_0006, // ID_AA64DFR0: ARMv8.0 debug, no PMU
+        k if k == r(6, 0) => 0x0000_0000_0021_1120, // ID_AA64ISAR0: AES+PMULL, SHA1, SHA2, CRC32, LSE atomics
         k if k == r(7, 0) => 0x0000_0000_0f00_0022, // ID_AA64MMFR0: 40-bit PA, 16-bit ASID, 4K granule only
         // everything else in the ID block (PFR1, DFR1, AFR, ISAR0-2, MMFR1-2, ZFR0, AArch32 regs) reads as 0
         k if k >> 14 == 1 && (k >> 11) & 7 == 0 && (k >> 7) & 15 == 0 && (k >> 3) & 15 >= 1 => 0,
@@ -722,6 +724,24 @@ impl Aarch64 {
                     self.wz(rs, !ok as u64, false);
                 }
             }
+            (0, 1, _) if n < 4 && rt2 == 31 => {
+                // CASP / CASPA / CASPL / CASPAL: compare-and-swap pair of 32- or 64-bit values
+                let eb = 4usize << ((i >> 30) & 1);
+                if rs & 1 == 1 || rt & 1 == 1 {
+                    return Err(self.undef(i));
+                }
+                let wide = eb == 8;
+                let m = if wide { !0u64 } else { 0xffff_ffff };
+                let (o1, o2) = (self.rd(bus, addr, eb)?, self.rd(bus, addr.wrapping_add(eb as u64), eb)?);
+                let (c1, c2) = (self.rz(rs) & m, self.rz((rs + 1) & 31) & m);
+                if o1 == c1 && o2 == c2 {
+                    let (n1, n2) = (self.rz(rt), self.rz((rt + 1) & 31));
+                    self.wr(bus, addr, eb, n1)?;
+                    self.wr(bus, addr.wrapping_add(eb as u64), eb, n2)?;
+                }
+                self.wz(rs, o1, wide);
+                self.wz((rs + 1) & 31, o2, wide);
+            }
             (1, 0, 1) => {
                 // LDAR / LDLAR
                 let v = self.rd(bus, addr, n)?;
@@ -1229,6 +1249,7 @@ impl Aarch64 {
                     3 if sf => if b == 0 { 0 } else { (a as i64).wrapping_div(b as i64) as u64 },
                     3 => { let (x, y) = (a as i32, b as i32); if y == 0 { 0 } else { x.wrapping_div(y) as u32 as u64 } }
                     8..=11 => shift_val(a, opcode - 8, b as u32, sf),
+                    16..=23 => self.crc32_insn(i, sf)?, // CRC32 / CRC32C
                     _ => return Err(self.undef(i)),
                 };
                 self.wz(rd, res, sf);

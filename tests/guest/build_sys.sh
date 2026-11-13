@@ -22,7 +22,7 @@ sed 's/@BASE@/0x80200000/; s/stack_top = .;/stack_top = .;\n  _end = .;/' link.l
 $RV -T out/rv_sbi.ld -o out/rv_sbi.elf rv_sbi.S
 riscv64-unknown-elf-objcopy -O binary out/rv_sbi.elf out/rv_sbi.Image
 # AArch64: FP / NEON (generated), MMU and interrupt guests
-A64F="clang --target=aarch64-none-elf -march=armv8.2-a+fp16+aes -O1 -ffreestanding -fno-builtin -nostdlib -fuse-ld=lld -Wl,--build-id=none"
+A64F="clang --target=aarch64-none-elf -march=armv8.2-a+fp16+aes+sha2+crc+lse -O1 -ffreestanding -fno-builtin -nostdlib -fuse-ld=lld -Wl,--build-id=none"
 python3 gen_a64_fp.py >/dev/null && python3 gen_a64_neon.py >/dev/null
 $A64F -T out/a64.ld -o out/a64_fp.elf a64_fp_start.S a64_fp.c
 $A64F -T out/a64.ld -o out/a64_neon.elf a64_fp_start.S a64_neon.c
