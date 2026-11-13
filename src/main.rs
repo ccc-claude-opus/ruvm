@@ -1,9 +1,11 @@
 use ruvm::machine::DevSpec;
+use ruvm::net::{HostFwd, NetConfig};
+use ruvm::virtio::net::NetSpec;
 use ruvm::{demo, is_linux_image, Arch, LinuxBoot, Machine, Stop};
 use std::process::exit;
 
 const USAGE: &str = "\
-ruvm 0.8 — a tiny QEMU-like emulator (RISC-V 64 / AArch64)
+ruvm 0.9 — a tiny QEMU-like emulator (RISC-V 64 / AArch64)
 
 USAGE:
     ruvm -M <riscv64|aarch64> (-kernel <file> | -demo hello) [options]
@@ -23,6 +25,7 @@ OPTIONS:
     -snapshot                     keep disk writes in memory (image file is not modified)
     -rng, -rng-seed <n>           attach a virtio-rng device (fixed seed for reproducible runs)
     -rtc <secs>                   start the RTC at this Unix time (default: host clock)
+    -nic user[,hostfwd=tcp::H-:G] virtio-net with a user-mode network (guest 10.0.2.15, gateway/host 10.0.2.2, DNS 10.0.2.3)
     -no-reboot                    exit instead of rebooting when the guest resets
     -input <text>                 type <text> on the guest console at start (\\n = newline)
     -send-after <pattern> <text>  type <text> once the console has printed <pattern> (repeatable)
@@ -53,6 +56,7 @@ fn main() {
     let (mut arch, mut kernel, mut demo_name) = (None, None, None);
     let mut drives: Vec<String> = Vec::new();
     let (mut rng, mut rng_seed, mut rtc, mut no_reboot) = (false, None, None, false);
+    let mut nic: Option<(Vec<HostFwd>, [u8; 6])> = None;
     let (mut snapshot, mut input) = (false, String::new());
     let mut expects: Vec<(String, String)> = Vec::new();
     let (mut initrd, mut append, mut bios, mut dumpdtb) = (None, String::new(), None, None);
@@ -85,6 +89,36 @@ fn main() {
             }
             "-rtc" => rtc = Some(val("-rtc").parse().unwrap_or_else(|_| die("-rtc expects seconds since the epoch"))),
             "-no-reboot" => no_reboot = true,
+            "-nic" | "-netdev" | "-net" => {
+                // user[,hostfwd=tcp::HOST-:GUEST][,mac=52:54:00:12:34:56]
+                let v = val("-nic");
+                let mut fwds = Vec::new();
+                let mut mac = [0x52, 0x54, 0x00, 0x12, 0x34, 0x56];
+                for (n, opt) in v.split(',').enumerate() {
+                    if n == 0 {
+                        if opt != "user" {
+                            die("only user-mode networking is supported: -nic user[,hostfwd=tcp::HOST-:GUEST]");
+                        }
+                    } else if let Some(r) = opt.strip_prefix("hostfwd=tcp:") {
+                        // [bind addr]:hostport-[guest addr]:guestport
+                        let (h, g) = r.split_once('-').unwrap_or_else(|| die("bad hostfwd"));
+                        let port = |s: &str| s.rsplit(':').next().and_then(|p| p.parse::<u16>().ok());
+                        match (port(h), port(g)) {
+                            (Some(host_port), Some(guest_port)) => fwds.push(HostFwd { host_port, guest_port }),
+                            _ => die("bad hostfwd (expected tcp::HOSTPORT-:GUESTPORT)"),
+                        }
+                    } else if let Some(m) = opt.strip_prefix("mac=") {
+                        let b: Vec<u8> = m.split(':').filter_map(|x| u8::from_str_radix(x, 16).ok()).collect();
+                        if b.len() != 6 {
+                            die("bad mac");
+                        }
+                        mac.copy_from_slice(&b);
+                    } else {
+                        die(&format!("unknown -nic option '{opt}'"));
+                    }
+                }
+                nic = Some((fwds, mac));
+            }
             "-initrd" => initrd = Some(val("-initrd")),
             "-append" => append = val("-append"),
             "-bios" => bios = Some(val("-bios")).filter(|b| b != "none"),
@@ -118,6 +152,10 @@ fn main() {
     }
     if rng {
         vm.attach(DevSpec::Rng(rng_seed)).unwrap_or_else(|e| die(&e));
+    }
+    if let Some((fwds, mac)) = nic {
+        let cfg = NetConfig::new(mac, &fwds).unwrap_or_else(|e| die(&e));
+        vm.attach(DevSpec::Net(NetSpec { cfg })).unwrap_or_else(|e| die(&e));
     }
 
     let loaded = match (kernel, demo_name) {

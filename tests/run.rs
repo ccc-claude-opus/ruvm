@@ -333,3 +333,91 @@ fn linux_ext4_root_reboot_riscv64() {
 fn linux_ext4_root_reboot_aarch64() {
     linux_root_reboot("aarch64", "arm64", "512", "ttyAMA0");
 }
+
+/// Boot with a virtio-net device and the user-mode network: the guest gets a DHCP lease,
+/// pings the gateway, fetches a page from a host HTTP server (TCP through the stack), talks to a
+/// host TFTP server (UDP), and accepts a connection the host opens through `hostfwd`.
+fn linux_network(arch: &str, dir: &str, mem: &str, console: &str) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::net::{TcpListener, TcpStream, UdpSocket};
+    use std::process::Stdio;
+    let base = env!("CARGO_MANIFEST_DIR");
+    let root = format!("{base}/tests/guest/out/linux/root/{dir}");
+    let kernel = format!("{base}/tests/guest/out/linux/debian/{dir}/linux");
+    if !std::path::Path::new(&format!("{root}/root.ext4")).exists() || !std::path::Path::new(&kernel).exists() {
+        eprintln!("skipped: run tools/linux/fetch-debian.sh {dir} and tools/linux/mkroot.sh {dir} first");
+        return;
+    }
+    // host services: HTTP on a TCP port, UDP echo
+    let http = TcpListener::bind("127.0.0.1:0").unwrap();
+    let hport = http.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        for mut s in http.incoming().flatten() {
+            let mut buf = [0u8; 1024];
+            let _ = s.read(&mut buf);
+            let body = "hello-from-host";
+            let _ = write!(s, "HTTP/1.0 200 OK\r\nContent-Length: {}\r\n\r\n{body}", body.len());
+        }
+    });
+    let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let uport = udp.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        // a one-shot TFTP server: answer a read request with a single DATA block
+        let mut buf = [0u8; 2048];
+        while let Ok((n, from)) = udp.recv_from(&mut buf) {
+            if n >= 2 && buf[1] == 1 {
+                let mut r = vec![0, 3, 0, 1];
+                r.extend_from_slice(b"tftp-ok");
+                let _ = udp.send_to(&r, from);
+            }
+        }
+    });
+    let fwd = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port(); // a free port
+    let tmp = std::env::temp_dir().join(format!("ruvm-net-{dir}-{}.ext4", std::process::id()));
+    std::fs::copy(format!("{root}/root.ext4"), &tmp).unwrap();
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ruvm"))
+        .args(["-M", arch, "-m", mem, "-kernel", &kernel, "-initrd", &format!("{root}/initramfs.cpio.gz")])
+        .args(["-drive", &format!("file={}", tmp.display()), "-nic", &format!("user,hostfwd=tcp::{fwd}-:7000")])
+        .args(["-append", &format!("console={console} rdinit=/init ruvm.test=net ruvm.port={hport} ruvm.uport={uport}")])
+        .args(["-icount", "100000000000"])
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut text = String::new();
+    let mut lines = BufReader::new(child.stdout.take().unwrap());
+    let mut line = String::new();
+    while lines.read_line(&mut line).unwrap_or(0) > 0 {
+        if line.starts_with("NET-FWD-READY") {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let mut c = TcpStream::connect(("127.0.0.1", fwd)).expect("connect through hostfwd");
+            c.write_all(b"from-host-to-guest\n").unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
+        text.push_str(&line);
+        line.clear();
+    }
+    let status = child.wait().unwrap();
+    std::fs::remove_file(&tmp).ok();
+    assert!(status.success(), "did not power off cleanly:\n{text}");
+    for want in [
+        "inet addr:10.0.2.15",
+        "NET-PING-OK",
+        "NET-HTTP: hello-from-host",
+        "NET-UDP: tftp-ok",
+        "NET-FWD-GOT: from-host-to-guest",
+    ] {
+        assert!(text.contains(want), "missing {want:?} in:\n{text}");
+    }
+}
+
+#[test]
+#[ignore]
+fn linux_user_network_riscv64() {
+    linux_network("riscv64", "riscv64", "256", "ttyS0");
+}
+
+#[test]
+#[ignore]
+fn linux_user_network_aarch64() {
+    linux_network("aarch64", "arm64", "512", "ttyAMA0");
+}

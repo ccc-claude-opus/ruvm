@@ -169,6 +169,7 @@ impl Machine {
                 Box::new(Aarch64::new())
             }
         };
+        bus.realtime_idle = self.devices.iter().any(|d| matches!(d, DevSpec::Net(_)));
         for (n, spec) in self.devices.iter().enumerate() {
             let (base, size, irq) = virtio_slot(arch, n);
             let backend: Box<dyn crate::virtio::Backend> = match spec {
@@ -230,6 +231,9 @@ impl Machine {
     pub fn attach(&mut self, spec: DevSpec) -> Result<(), String> {
         if self.devices.len() >= MAX_VIRTIO {
             return Err("too many virtio devices".into());
+        }
+        if matches!(spec, DevSpec::Net(_)) {
+            self.bus.realtime_idle = true;
         }
         self.devices.push(spec);
         let n = self.devices.len() - 1;

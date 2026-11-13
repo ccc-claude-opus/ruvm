@@ -7,6 +7,7 @@
 //!   cpu      instruction-set interpreters (riscv64, aarch64)
 //!   host     "semihosting" syscalls (exit / write)
 //!   virtio   virtio-mmio transport + block / entropy / network back-ends
+//!   net      user-mode network stack (ARP, DHCP, ICMP, UDP, TCP proxy, port forwarding)
 //!   machine  glues CPU + bus together, loads ELF / raw images
 //!   demo     tiny built-in assemblers + demo programs
 pub mod bus;
@@ -17,6 +18,7 @@ pub mod fdt;
 pub mod gic;
 pub mod host;
 pub mod machine;
+pub mod net;
 pub mod virtio;
 
 pub use machine::{is_linux_image, Arch, LinuxBoot, Machine, Stop};

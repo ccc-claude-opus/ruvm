@@ -63,7 +63,7 @@ open(p, "wb").write(d)
 PY
     }
     getmod() { f=$(find "$W/udeb" "$W/rd/usr/lib/modules" -name "$1.ko.xz" | head -1); [ -n "$f" ] || { echo "missing module $1"; exit 1; }; xz -dc "$f" > "$MODS/$1.ko"; strip_sig "$MODS/$1.ko"; }
-    for m in crc16 crc32c_generic libcrc32c mbcache jbd2 ext4 virtio_mmio virtio_blk virtio-rng; do getmod $m; done
+    for m in crc16 crc32c_generic libcrc32c mbcache jbd2 ext4 virtio_mmio virtio_blk virtio-rng failover net_failover virtio_net; do getmod $m; done
 
     # ---- initramfs
     I=$W/initramfs; mkdir -p $I/bin $I/lib/modules $I/proc $I/sys $I/dev $I/mnt $I/tmp
@@ -76,7 +76,7 @@ export PATH=/bin:/sbin
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t devtmpfs devtmpfs /dev 2>/dev/null
-for m in crc16 crc32c_generic libcrc32c mbcache jbd2 ext4 virtio_mmio virtio_blk virtio-rng; do
+for m in crc16 crc32c_generic libcrc32c mbcache jbd2 ext4 virtio_mmio virtio_blk virtio-rng failover net_failover virtio_net; do
     insmod /lib/modules/$m.ko
 done
 i=0
@@ -126,6 +126,21 @@ case "$(cat /proc/cmdline)" in
         echo "done"
         poweroff -f
     fi ;;
+*ruvm.test=net*)
+    ifconfig lo 127.0.0.1 up
+    ifconfig eth0 up
+    udhcpc -i eth0 -n -q -s /etc/udhcpc.script
+    echo "NET-IP: $(ifconfig eth0 | grep 'inet addr' | tr -s ' ')"
+    ping -c 2 -W 3 10.0.2.2 > /dev/null && echo "NET-PING-OK"
+    P=$(sed -n 's/.*ruvm.port=\([0-9]*\).*/\1/p' /proc/cmdline)
+    U=$(sed -n 's/.*ruvm.uport=\([0-9]*\).*/\1/p' /proc/cmdline)
+    echo "NET-HTTP: $(wget -q -O - http://10.0.2.2:$P/hello)"
+    tftp -g -r hello -l /tmp/udp.out 10.0.2.2 $U > /dev/null 2>&1
+    echo "NET-UDP: $(cat /tmp/udp.out 2>/dev/null)"
+    echo "NET-FWD-READY"
+    echo "NET-FWD-GOT: $(nc -l -p 7000 -w 30)"
+    echo "done"
+    poweroff -f ;;
 *ruvm.test=poweroff*)
     echo "done"
     poweroff -f ;;
@@ -134,6 +149,19 @@ exec setsid cttyhack sh
 INIT
     chmod +x $R/sbin/init
     echo "ruvm" > $R/etc/hostname
+    cat > $R/etc/udhcpc.script <<'UDHCPC'
+#!/bin/sh
+# udhcpc event script: configure the interface from the lease
+case "$1" in
+bound|renew)
+    ifconfig $interface $ip netmask ${subnet:-255.255.255.0} up
+    [ -n "$router" ] && route add default gw ${router%% *} dev $interface 2>/dev/null
+    : > /etc/resolv.conf
+    for d in $dns; do echo "nameserver $d" >> /etc/resolv.conf; done ;;
+esac
+exit 0
+UDHCPC
+    chmod +x $R/etc/udhcpc.script
     rm -f "$OUT/root.ext4"
     "$MKE2FS" -q -t ext4 -L ruvm-root -E root_owner=0:0 -d $R "$OUT/root.ext4" ${DISK_MB}M
     rm -rf "$W"

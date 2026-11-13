@@ -106,6 +106,8 @@ pub struct Bus {
     pub irq_dirty: bool,
     /// Host stdin is connected: idle loops (WFI) should really sleep.
     pub interactive: bool,
+    /// External events can arrive at any time (network): idle in real time, never skip ahead.
+    pub realtime_idle: bool,
 }
 
 const CLINT_SIZE: u64 = 0x1_0000;
@@ -127,6 +129,7 @@ impl Bus {
             reset: false,
             irq_dirty: false,
             interactive: false,
+            realtime_idle: false,
         }
     }
 
@@ -296,7 +299,7 @@ impl Bus {
     pub fn idle(&mut self, deadline: u64) {
         let c = &mut self.clint;
         let next = c.mtimecmp.min(deadline);
-        if self.interactive {
+        if self.interactive || self.realtime_idle {
             std::thread::sleep(std::time::Duration::from_micros(500));
             c.mtime += 5_000;
             if next > c.mtime && next - c.mtime < 5_000 {

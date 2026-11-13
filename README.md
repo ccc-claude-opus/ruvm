@@ -8,6 +8,9 @@ trap delegation, Sv39 paging, the C extension, CLINT timer/software interrupts a
 a PLIC; AArch64 EL0/EL1 exceptions, exclusives and LSE atomics. Both are checked
 instruction-for-instruction against `qemu-system-*` (see [doc/v0.2.md](doc/v0.2.md)).
 
+**v0.9: networking** — `-nic user[,hostfwd=tcp::H-:G]`: virtio-net + a user-mode stack (DHCP, DNS, TCP/UDP to the
+host and the internet, port forwarding), no root needed ([doc/v0.9.md](doc/v0.9.md)).
+
 **v0.8** is a speed pass with honest numbers (~120 MIPS; [doc/v0.8.md](doc/v0.8.md), `tools/bench.sh`).
 
 **v0.7: a usable system** — ext4 root on virtio-blk, virtio-rng, RTC, real reboot; both architectures
@@ -87,6 +90,7 @@ src/cpu/softfloat.rs  bit-exact IEEE 754 binary32/64 (all rounding modes, flags)
 src/fdt.rs        device-tree blob writer
 src/cpu/rvc.rs    compressed-instruction expander
 src/virtio/        virtio-mmio (v2) transport; blk / rng / net back-ends
+src/net/          user-mode network stack for virtio-net
 src/cpu/aarch64.rs  A64 core: integer, EL0/EL1 exceptions, exclusives, LSE, generic timer, IRQs
 src/cpu/aarch64/    mmu.rs (stage-1 MMU), fp.rs (scalar FP), neon.rs + simd.rs (Advanced SIMD)
 src/gic.rs        ARM GICv2
