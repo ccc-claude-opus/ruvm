@@ -3,7 +3,7 @@
 use crate::bus::Bus;
 use crate::cpu::{aarch64::Aarch64, riscv::Riscv64, Cpu};
 use crate::devices::{
-    forward_stdin, Clint, GoldfishRtc, Pl011, Pl031, SharedRx, SharedScript, TestFinisher, Uart, UartKind,
+    forward_stdin, Clint, GoldfishRtc, Pl011, Pl031, SharedRx, SharedScript, TestFinisher, Uart,
 };
 use crate::fdt::Fdt;
 use crate::virtio::blk::{Disk, VirtioBlk};
@@ -173,7 +173,7 @@ impl Machine {
                 bus.map_irq(0x10_1000, 0x1000, 11, Box::new(GoldfishRtc::new(self.rtc_epoch)));
                 bus.map_clint(0x200_0000);
                 bus.map_plic(0xc00_0000);
-                bus.map_irq(0x1000_0000, 0x100, 10, Box::new(Uart::new(UartKind::Ns16550, rx, script)));
+                bus.map_irq(0x1000_0000, 0x100, 10, Box::new(Uart::new(rx, script)));
                 (0..self.ncpus).map(|i| Box::new(Riscv64::new(i)) as Box<dyn Cpu>).collect()
             }
             Arch::Aarch64 => {

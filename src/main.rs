@@ -5,7 +5,7 @@ use ruvm::{demo, is_linux_image, Arch, LinuxBoot, Machine, Stop};
 use std::process::exit;
 
 const USAGE: &str = "\
-ruvm 0.11 — a tiny QEMU-like emulator (RISC-V 64 / AArch64)
+ruvm 1.0 — a tiny QEMU-like emulator (RISC-V 64 / AArch64)
 
 USAGE:
     ruvm -M <riscv64|aarch64> (-kernel <file> | -demo hello) [options]

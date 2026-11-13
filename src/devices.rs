@@ -9,14 +9,6 @@ use std::sync::mpsc::{Receiver, Sender};
 pub type SharedRx = Arc<Mutex<Receiver<u8>>>;
 use std::sync::{Arc, Mutex};
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum UartKind {
-    /// NS16550A, as found on the RISC-V `virt` board.
-    Ns16550,
-    /// ARM PrimeCell PL011, as found on the ARM `virt` board.
-    Pl011,
-}
-
 /// Expect-style console input: each step types its text once the guest's console
 /// output ends with the step's pattern (like `expect`/`send`).
 #[derive(Default)]
@@ -58,7 +50,6 @@ impl ConsoleScript {
 pub type SharedScript = Arc<Mutex<ConsoleScript>>;
 
 pub struct Uart {
-    kind: UartKind,
     rx: Option<SharedRx>,
     script: SharedScript,
     pending: Option<u8>,
@@ -77,8 +68,8 @@ pub struct Uart {
 impl Uart {
     /// `rx`: bytes the guest will receive (host stdin, scripted input, ...);
     /// `script`: expect-style input that waits for console output.
-    pub fn new(kind: UartKind, rx: Option<SharedRx>, script: SharedScript) -> Self {
-        Uart { kind, rx, script, pending: None, ier: 0, lcr: 0, mcr: 0, scr: 0, fcr: 0, dll: 0, dlm: 0, thre: false }
+    pub fn new(rx: Option<SharedRx>, script: SharedScript) -> Self {
+        Uart { rx, script, pending: None, ier: 0, lcr: 0, mcr: 0, scr: 0, fcr: 0, dll: 0, dlm: 0, thre: false }
     }
 
     fn rx_ready(&mut self) -> bool {
@@ -119,83 +110,60 @@ pub fn forward_stdin(tx: Sender<u8>) {
 
 impl Device for Uart {
     fn read(&mut self, off: u64, _size: usize) -> u64 {
-        match self.kind {
-            UartKind::Ns16550 => (match off {
-                0 if self.dlab() => self.dll,
-                0 => {
-                    self.rx_ready();
-                    self.pending.take().unwrap_or(0)
+        (match off {
+            0 if self.dlab() => self.dll,
+            0 => {
+                self.rx_ready();
+                self.pending.take().unwrap_or(0)
+            }
+            1 if self.dlab() => self.dlm,
+            1 => self.ier,
+            2 => {
+                // IIR: FIFOs enabled (0xc0) | interrupt id
+                let fifo = if self.fcr & 1 != 0 { 0xc0 } else { 0 };
+                fifo | if self.ier & 1 != 0 && self.rx_ready() {
+                    0x04
+                } else if self.ier & 2 != 0 && self.thre {
+                    self.thre = false;
+                    0x02
+                } else {
+                    0x01
                 }
-                1 if self.dlab() => self.dlm,
-                1 => self.ier,
-                2 => {
-                    // IIR: FIFOs enabled (0xc0) | interrupt id
-                    let fifo = if self.fcr & 1 != 0 { 0xc0 } else { 0 };
-                    fifo | if self.ier & 1 != 0 && self.rx_ready() {
-                        0x04
-                    } else if self.ier & 2 != 0 && self.thre {
-                        self.thre = false;
-                        0x02
-                    } else {
-                        0x01
-                    }
-                }
-                3 => self.lcr,
-                4 => self.mcr,
-                5 => 0x60 | self.rx_ready() as u8, // THRE | TEMT | DR
-                6 => 0xb0,                         // MSR: DCD | DSR | CTS
-                7 => self.scr,
-                _ => 0,
-            }) as u64,
-            // PL011: DR / FR
-            UartKind::Pl011 => match off {
-                0x00 => {
-                    self.rx_ready();
-                    self.pending.take().unwrap_or(0) as u64
-                }
-                0x18 => {
-                    if self.rx_ready() { 0x80 } else { 0x90 } // TXFE (| RXFE)
-                }
-                _ => 0,
-            },
-        }
+            }
+            3 => self.lcr,
+            4 => self.mcr,
+            5 => 0x60 | self.rx_ready() as u8, // THRE | TEMT | DR
+            6 => 0xb0,                         // MSR: DCD | DSR | CTS
+            7 => self.scr,
+            _ => 0,
+        }) as u64
     }
 
     fn write(&mut self, off: u64, _size: usize, val: u64) {
         let v = val as u8;
-        match self.kind {
-            UartKind::Ns16550 => match off {
-                0 if self.dlab() => self.dll = v,
-                0 => {
-                    self.tx(v);
-                    self.thre = true;
-                }
-                1 if self.dlab() => self.dlm = v,
-                1 => {
-                    if v & 2 != 0 && self.ier & 2 == 0 {
-                        self.thre = true; // enabling ETBEI with an empty THR raises it at once
-                    }
-                    self.ier = v & 0x0f;
-                }
-                2 => self.fcr = v & 0xc9,
-                3 => self.lcr = v,
-                4 => self.mcr = v,
-                7 => self.scr = v,
-                _ => {}
-            },
-            UartKind::Pl011 => {
-                if off == 0 {
-                    self.tx(v);
-                }
+        match off {
+            0 if self.dlab() => self.dll = v,
+            0 => {
+                self.tx(v);
+                self.thre = true;
             }
+            1 if self.dlab() => self.dlm = v,
+            1 => {
+                if v & 2 != 0 && self.ier & 2 == 0 {
+                    self.thre = true; // enabling ETBEI with an empty THR raises it at once
+                }
+                self.ier = v & 0x0f;
+            }
+            2 => self.fcr = v & 0xc9,
+            3 => self.lcr = v,
+            4 => self.mcr = v,
+            7 => self.scr = v,
+            _ => {}
         }
     }
 
     fn irq(&mut self) -> bool {
-        match self.kind {
-            UartKind::Ns16550 => (self.ier & 1 != 0 && self.rx_ready()) || (self.ier & 2 != 0 && self.thre),
-            UartKind::Pl011 => false,
-        }
+        (self.ier & 1 != 0 && self.rx_ready()) || (self.ier & 2 != 0 && self.thre)
     }
 }
 

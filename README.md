@@ -1,74 +1,80 @@
 # ruvm
 
-A small QEMU-like machine emulator in Rust (no dependencies). It interprets
-**RISC-V 64** and **AArch64** guests on a QEMU-`virt`-style board.
+A QEMU-like machine emulator in Rust, with no dependencies. It interprets **RISC-V 64** and **AArch64** guests on
+QEMU-`virt`-style boards, and boots **unmodified Debian Linux on both** — to a shell, from an ext4 disk, with
+networking and up to 8 CPUs. Instruction behaviour is checked against `qemu-system-*`.
 
-v0.2 adds the system-level pieces needed for kernels: RISC-V M/S/U modes with
-trap delegation, Sv39 paging, the C extension, CLINT timer/software interrupts and
-a PLIC; AArch64 EL0/EL1 exceptions, exclusives and LSE atomics. Both are checked
-instruction-for-instruction against `qemu-system-*` (see [doc/v0.2.md](doc/v0.2.md)).
-
-**v0.11: ISA completion** — AArch64 FP estimates / CRC32 / AES / SHA / CASP; RISC-V Zba/Zbb/Zbc/Zbs, Zicond, Zicbom/Zicboz,
-Svinval, Sv48 and enforced PMP; all checked against QEMU ([doc/v0.11.md](doc/v0.11.md)).
-
-**v0.10: SMP** — `-smp N` (1–8 CPUs) on both architectures: round-robin scheduling, SBI HSM/IPI/RFENCE, multi-CPU GICv2,
-PSCI `CPU_ON`; Linux and xv6 run on several CPUs ([doc/v0.10.md](doc/v0.10.md)).
-
-**v0.9: networking** — `-nic user[,hostfwd=tcp::H-:G]`: virtio-net + a user-mode stack (DHCP, DNS, TCP/UDP to the
-host and the internet, port forwarding), no root needed ([doc/v0.9.md](doc/v0.9.md)).
-
-**v0.8** is a speed pass with honest numbers (~120 MIPS; [doc/v0.8.md](doc/v0.8.md), `tools/bench.sh`).
-
-**v0.7: a usable system** — ext4 root on virtio-blk, virtio-rng, RTC, real reboot; both architectures
-boot from a disk image, write to it and keep the data across a reboot ([doc/v0.7.md](doc/v0.7.md)):
-
-```
-tools/linux/fetch-debian.sh && tools/linux/mkroot.sh
-./target/release/ruvm -M riscv64 -m 256 -kernel tests/guest/out/linux/debian/riscv64/linux \
-    -initrd tests/guest/out/linux/root/riscv64/initramfs.cpio.gz \
-    -drive file=tests/guest/out/linux/root/riscv64/root.ext4 -rng \
-    -append "console=ttyS0 rdinit=/init" -serial stdio
-```
-
-**v0.6 boots Linux on AArch64 too**: Debian 13's stock arm64 kernel (6.12) reaches a busybox
-shell and powers off through PSCI — MMU, GICv2, generic timer, PL011, FP and Advanced SIMD, all checked against
-`qemu-system-aarch64` ([doc/v0.6.md](doc/v0.6.md)):
-
-```
-tools/linux/fetch-debian.sh arm64
-./target/release/ruvm -M aarch64 -m 1024 -kernel tests/guest/out/linux/debian/arm64/linux \
-    -initrd tests/guest/out/linux/debian/arm64/initrd.gz -append "console=ttyAMA0 rdinit=/bin/sh" -serial stdio
-```
-
-**v0.5 boots Linux on RISC-V**: Debian 13's stock riscv64 kernel (6.12) runs to a
-busybox shell and powers off cleanly ([doc/v0.5.md](doc/v0.5.md)):
-
-```
-tools/linux/fetch-debian.sh riscv64
-./target/release/ruvm -M riscv64 -m 512 -kernel tests/guest/out/linux/debian/riscv64/linux \
-    -initrd tests/guest/out/linux/debian/riscv64/initrd.gz -append "console=ttyS0 rdinit=/bin/sh" -serial stdio
-```
-
-v0.4 adds bit-exact F/D floating point, a device-tree generator, a built-in SBI and the
-Linux `Image` boot protocol (`-kernel/-initrd/-append`), and runs real OpenSBI firmware
-(`-bios`) ([doc/v0.4.md](doc/v0.4.md)).
-
-v0.3 boots **MIT xv6-riscv** to its shell from a virtio block device
-([doc/v0.3.md](doc/v0.3.md)). The goal is Linux on both architectures — see
-[doc/roadmap.md](doc/roadmap.md).
-
-```
-./target/release/ruvm -M riscv64 -kernel tests/guest/prebuilt/xv6/kernel \
-    -drive file=tests/guest/prebuilt/xv6/fs.img -snapshot -serial stdio
-```
+## Quick start
 
 ```
 cargo build --release
-./target/release/ruvm -M riscv64 -demo hello
-./target/release/ruvm -M aarch64 -demo hello
-./target/release/ruvm -M riscv64 -kernel prog.elf [-m 256] [-d] [-regs] [-icount N] [-serial stdio]
-./target/release/ruvm -M riscv64 -kernel kernel -drive file=disk.img [-snapshot] [-input "ls\n"]
+tools/linux/fetch-debian.sh && tools/linux/mkroot.sh      # Debian kernels + a small ext4 root (once)
+
+# RISC-V
+./target/release/ruvm -M riscv64 -m 512 -smp 2 -kernel tests/guest/out/linux/debian/riscv64/linux \
+    -initrd tests/guest/out/linux/root/riscv64/initramfs.cpio.gz \
+    -drive file=tests/guest/out/linux/root/riscv64/root.ext4 -rng -nic user \
+    -append "console=ttyS0 rdinit=/init" -serial stdio
+
+# ARM
+./target/release/ruvm -M aarch64 -m 1024 -smp 2 -kernel tests/guest/out/linux/debian/arm64/linux \
+    -initrd tests/guest/out/linux/root/arm64/initramfs.cpio.gz \
+    -drive file=tests/guest/out/linux/root/arm64/root.ext4 -rng -nic user \
+    -append "console=ttyAMA0 rdinit=/init" -serial stdio
 ```
+
+Other guests: `-demo hello`, bare ELF programs (`-kernel prog.elf`), MIT xv6-riscv
+(`-kernel tests/guest/prebuilt/xv6/kernel -drive file=tests/guest/prebuilt/xv6/fs.img -snapshot`), OpenSBI (`-bios`).
+Options: `-m MB`, `-smp N`, `-drive file=…[,…]`, `-snapshot`, `-rng`, `-rng-seed`, `-nic user[,hostfwd=tcp::H-:G]`,
+`-rtc`, `-no-reboot`, `-input`, `-send-after`, `-d`, `-regs`, `-icount`. `ruvm -h` lists them all.
+
+## What is implemented
+
+| | RISC-V 64 | AArch64 |
+|---|---|---|
+| ISA | RV64IMAFDC, Zba/Zbb/Zbc/Zbs, Zicond, Zicbom/Zicboz, Zicsr, Svinval, Sstc | A64 integer, LSE atomics, scalar FP + Advanced SIMD (bit-exact), CRC32, AES, SHA-1/256, PMULL |
+| Privilege / MMU | M/S/U, delegation, Sv39/Sv48, PMP | EL0/EL1, 4K granule, 48-bit VA, TTBR0/1 |
+| Interrupts / timer | CLINT + PLIC, Sstc | GICv2, generic timer |
+| Firmware | built-in SBI (HSM, IPI, RFENCE, PMU, reset) or OpenSBI | built-in PSCI 1.1 |
+| SMP | up to 8 harts | up to 8 CPUs (`CPU_ON`) |
+
+Devices (both boards): NS16550 / PL011 console, virtio-mmio block, rng and net (user-mode network stack: DHCP, DNS,
+ICMP, UDP, TCP, port forwarding), RTC, power-off and reboot. A device tree is generated for each board.
+
+**Not implemented**: RISC-V V and H, ARM EL2/EL3, SVE, pointer authentication, GICv3, PCI, graphics, JIT.
+Speed is that of a plain interpreter, about 120 MIPS (see [doc/v0.8.md](doc/v0.8.md)); a Debian boot takes about a minute.
+
+## Testing
+
+```
+tools/ci.sh        # build with -D warnings, all tests, then the Linux boot tests on both architectures
+cargo test --release
+```
+
+The differential tests run hand-written and generated guests (`tests/guest/`) and compare their output byte for byte with
+references recorded from `qemu-system-*`; `tests/guest/build_sys.sh` regenerates both (needs QEMU and LLVM).
+The `#[ignore]` tests boot real Linux (they need `fetch-debian.sh` and `mkroot.sh` first).
+
+## History
+
+| Version | Added |
+|---|---|
+| v1.0 | consolidation: CI script, cleanup, docs ([doc/v1.0.md](doc/v1.0.md)) |
+| v0.11 | ISA completion: FP estimates, CRC32, AES, SHA, CASP; RISC-V B, Zicond, Zicbo\*, Svinval, Sv48, PMP ([doc/v0.11.md](doc/v0.11.md)) |
+| v0.10 | SMP ([doc/v0.10.md](doc/v0.10.md)) |
+| v0.9 | virtio-net and a user-mode network stack ([doc/v0.9.md](doc/v0.9.md)) |
+| v0.8 | speed pass ([doc/v0.8.md](doc/v0.8.md)) |
+| v0.7 | ext4 root on virtio-blk, rng, RTC, reboot ([doc/v0.7.md](doc/v0.7.md)) |
+| v0.6 | AArch64 Linux: MMU, GICv2, timer, FP/NEON, PSCI ([doc/v0.6.md](doc/v0.6.md)) |
+| v0.5 | RISC-V Linux ([doc/v0.5.md](doc/v0.5.md)) |
+| v0.4 | RISC-V F/D, device tree, SBI, OpenSBI ([doc/v0.4.md](doc/v0.4.md)) |
+| v0.3 | xv6-riscv, virtio-blk ([doc/v0.3.md](doc/v0.3.md)) |
+| v0.2 | privileged architecture for both ([doc/v0.2.md](doc/v0.2.md)) |
+| v0.1 | user-level RV64IMA / A64 integer |
+
+See [doc/roadmap.md](doc/roadmap.md) for the plan and what comes after 1.0.
+
+## Memory map
 
 | | riscv64 | aarch64 |
 |---|---|---|
