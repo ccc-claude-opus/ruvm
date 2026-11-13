@@ -101,6 +101,9 @@ pub struct Bus {
     pub halt: Option<i32>,
     /// Set when the guest asked for a reset (reboot).
     pub reset: bool,
+    /// Set by every device access: interrupt lines may have changed, so the CPU should
+    /// re-evaluate pending interrupts before its next instruction.
+    pub irq_dirty: bool,
     /// Host stdin is connected: idle loops (WFI) should really sleep.
     pub interactive: bool,
 }
@@ -122,6 +125,7 @@ impl Bus {
             gic_base: None,
             halt: None,
             reset: false,
+            irq_dirty: false,
             interactive: false,
         }
     }
@@ -213,6 +217,7 @@ impl Bus {
     }
 
     fn mmio_read(&mut self, addr: u64, size: usize) -> Result<u64, BusError> {
+        self.irq_dirty = true;
         if let Some(b) = self.clint_base.filter(|&b| addr >= b && addr < b + CLINT_SIZE) {
             return Ok(self.clint.read(addr - b, size));
         }
@@ -235,6 +240,7 @@ impl Bus {
     }
 
     fn mmio_write(&mut self, addr: u64, size: usize, val: u64) -> Result<(), BusError> {
+        self.irq_dirty = true;
         if let Some(b) = self.clint_base.filter(|&b| addr >= b && addr < b + CLINT_SIZE) {
             self.clint.write(addr - b, size, val);
             return Ok(());

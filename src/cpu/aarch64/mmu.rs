@@ -13,9 +13,9 @@ pub const TLB_SIZE: usize = 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Access {
-    Fetch,
-    Read,
-    Write,
+    Fetch = 0,
+    Read = 1,
+    Write = 2,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -31,6 +31,8 @@ pub struct TlbEntry {
     uxn: bool,
     pxn: bool,
     level: u8,
+    /// Precomputed permissions: bit `el0 * 3 + access` (Fetch = 0, Read = 1, Write = 2).
+    perm: u8,
 }
 
 // SCTLR_EL1 bits
@@ -54,9 +56,9 @@ impl Aarch64 {
 
     fn fault(&self, acc: Access, va: u64, fsc: u32) -> Ex {
         match acc {
-            Access::Fetch => Ex::Sync { ec: EC_IABORT_LOWER, iss: fsc, far: Some(va), next: false },
-            Access::Read => Ex::Sync { ec: EC_DABORT_LOWER, iss: fsc, far: Some(va), next: false },
-            Access::Write => Ex::Sync { ec: EC_DABORT_LOWER, iss: fsc | 1 << 6, far: Some(va), next: false },
+            Access::Fetch => Ex::sync(EC_IABORT_LOWER, fsc, Some(va), false),
+            Access::Read => Ex::sync(EC_DABORT_LOWER, fsc, Some(va), false),
+            Access::Write => Ex::sync(EC_DABORT_LOWER, fsc | 1 << 6, Some(va), false),
         }
     }
 
@@ -80,23 +82,26 @@ impl Aarch64 {
     }
 
     /// Translate `va` for an access performed at the current EL (or as EL0 when `el0`).
+    #[inline(always)]
     pub(super) fn translate(&mut self, bus: &mut Bus, va: u64, acc: Access, el0: bool) -> Result<u64, Ex> {
         if self.sctlr & SCTLR_M == 0 {
             return Ok(va & 0x0000_ffff_ffff_ffff);
         }
         let el0 = el0 || self.el == 0;
         let vpn = va >> 12;
-        let slot = (vpn as usize) & (TLB_SIZE - 1);
-        let e = self.tlb[slot];
+        let e = &self.tlb[(vpn as usize) & (TLB_SIZE - 1)];
         if e.vpn == vpn && e.gen == self.tlb_gen && (!e.ng || e.asid == self.asid) {
-            if !self.perm_ok(&e, el0, acc) {
-                return Err(self.fault(acc, va, 0x0c + e.level as u32));
+            if e.perm >> (el0 as u8 * 3 + acc as u8) & 1 != 0 {
+                return Ok(e.ppn << 12 | (va & 0xfff));
             }
-            return Ok(e.ppn << 12 | (va & 0xfff));
+            let level = e.level;
+            return Err(self.fault(acc, va, 0x0c + level as u32));
         }
         self.walk(bus, va, acc, el0)
     }
 
+    #[cold]
+    #[inline(never)]
     fn walk(&mut self, bus: &mut Bus, va: u64, acc: Access, el0: bool) -> Result<u64, Ex> {
         let tcr = self.tcr;
         // select the translation table by VA[55] (top-byte-ignore aware)
@@ -184,7 +189,12 @@ impl Aarch64 {
             uxn: desc >> 54 & 1 == 1 || uxnt,
             pxn: desc >> 53 & 1 == 1 || pxnt,
             level: level as u8,
+            perm: 0,
         };
+        let mut e = e;
+        for (k, a) in [Access::Fetch, Access::Read, Access::Write].into_iter().enumerate() {
+            e.perm |= (self.perm_ok(&e, false, a) as u8) << k | (self.perm_ok(&e, true, a) as u8) << (3 + k);
+        }
         if !self.perm_ok(&e, el0, acc) {
             return Err(self.fault(acc, va, 0x0c + level as u32));
         }
@@ -238,7 +248,7 @@ impl Aarch64 {
             return Ok(u32::from_le_bytes(bus.ram()[off..off + 4].try_into().unwrap()));
         }
         let pa = self.translate(bus, pc, Access::Fetch, false)?;
-        let w = bus.read(pa, 4).map_err(|_| Ex::Sync { ec: EC_IABORT_LOWER, iss: 0x10, far: Some(pc), next: false })?;
+        let w = bus.read(pa, 4).map_err(|_| Ex::sync(EC_IABORT_LOWER, 0x10, Some(pc), false))?;
         if let Some(off) = bus.ram_off(pa & !0xfff, 0x1000) {
             self.fetch_vpn = (pc >> 12) + 1;
             self.fetch_off = off;

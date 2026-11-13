@@ -87,16 +87,30 @@ const EC_IABORT_LOWER: u32 = 0x20;
 const EC_DABORT_LOWER: u32 = 0x24;
 const EC_BRK: u32 = 0x3c;
 
-/// Why an instruction did not complete.
-enum Ex {
+/// Why an instruction did not complete. Boxed so that `Result<T, Ex>` stays two words wide
+/// (the common, successful path returns in registers); allocation only happens on faults.
+pub struct Ex(Box<ExKind>);
+
+enum ExKind {
     Stop(Stop),
     /// Synchronous exception: class, syndrome, faulting address, return to next insn?
     Sync { ec: u32, iss: u32, far: Option<u64>, next: bool },
 }
 
+impl Ex {
+    #[cold]
+    fn sync(ec: u32, iss: u32, far: Option<u64>, next: bool) -> Ex {
+        Ex(Box::new(ExKind::Sync { ec, iss, far, next }))
+    }
+    #[cold]
+    fn stop(s: Stop) -> Ex {
+        Ex(Box::new(ExKind::Stop(s)))
+    }
+}
+
 impl From<Stop> for Ex {
     fn from(s: Stop) -> Ex {
-        Ex::Stop(s)
+        Ex::stop(s)
     }
 }
 
@@ -143,12 +157,17 @@ pub struct Aarch64 {
     /// Debug aid (env RUVM_LOG_UNDEF): log every undefined-instruction exception.
     log_undef: bool,
     last_insn: u32,
+    /// Interrupt-relevant state changed: end the current batch so `pre` runs again.
+    recheck: bool,
+    bitmask_cache: Vec<(u32, Option<(u64, u64)>)>,
 }
 
+#[inline(always)]
 fn ones(n: u32) -> u64 {
     if n >= 64 { !0 } else { (1u64 << n) - 1 }
 }
 
+#[inline(always)]
 fn ror(v: u64, r: u32, size: u32) -> u64 {
     if size == 32 {
         (v as u32).rotate_right(r) as u64
@@ -190,6 +209,7 @@ fn decode_bitmasks(n: u32, imms: u32, immr: u32, immediate: bool, datasize: u32)
     Some((rep(wrot), rep(telem)))
 }
 
+#[inline(always)]
 fn shift_val(v: u64, kind: u32, amt: u32, sf: bool) -> u64 {
     if sf {
         let a = amt & 63;
@@ -211,6 +231,7 @@ fn shift_val(v: u64, kind: u32, amt: u32, sf: bool) -> u64 {
     }
 }
 
+#[inline(always)]
 fn extend(v: u64, opt: u32) -> u64 {
     match opt {
         0 => v & 0xff,
@@ -224,6 +245,7 @@ fn extend(v: u64, opt: u32) -> u64 {
 }
 
 /// AddWithCarry; returns (result, (N, Z, C, V)).
+#[inline(always)]
 fn awc(a: u64, b: u64, cin: bool, sf: bool) -> (u64, (bool, bool, bool, bool)) {
     if sf {
         let (r1, c1) = a.overflowing_add(b);
@@ -240,6 +262,47 @@ fn awc(a: u64, b: u64, cin: bool, sf: bool) -> (u64, (bool, bool, bool, bool)) {
 }
 
 impl Aarch64 {
+    /// Timers and interrupts, checked between instructions. Returns true if an IRQ was taken.
+    #[inline(always)]
+    fn pre(&mut self, bus: &mut Bus) -> bool {
+        if bus.clint.mtime >= self.timer_deadline {
+            self.update_timers(bus);
+        }
+        if bus.gic.irq_line && self.daif & 2 == 0 && self.sysreg(SYS_VBAR_EL1) != 0 {
+            self.irq_exception();
+            return true;
+        }
+        false
+    }
+
+    /// Handle an exception that stopped an instruction: enter the EL1 handler, or stop the VM.
+    #[cold]
+    #[inline(never)]
+    fn handle_ex(&mut self, bus: &mut Bus, e: Ex) -> Result<(), Stop> {
+        match *e.0 {
+            ExKind::Stop(s) => Err(s),
+            ExKind::Sync { ec, iss, far, next } => {
+                if self.sysreg(SYS_VBAR_EL1) == 0 {
+                    let i = bus.read(self.pc, 4).unwrap_or(0);
+                    return Err(Stop::Fatal(match ec {
+                        EC_UNKNOWN => format!("undefined instruction {:#010x} at pc={:#x}", i, self.pc),
+                        EC_BRK => format!("BRK #{} at pc={:#x}", iss, self.pc),
+                        _ => format!(
+                            "unhandled exception EC={:#x} ISS={:#x} FAR={:#x} at pc={:#x} (data abort / bus error, VBAR_EL1 not set)",
+                            ec, iss, far.unwrap_or(0), self.pc
+                        ),
+                    }));
+                }
+                if ec == EC_UNKNOWN && self.log_undef {
+                    eprintln!("[undef] EL{} pc={:#x} insn={:08x}", self.el, self.pc, self.last_insn);
+                }
+                let ret = if next { self.pc.wrapping_add(4) } else { self.pc };
+                self.exception(ec, iss, far, ret);
+                Ok(())
+            }
+        }
+    }
+
     pub fn new() -> Self {
         Aarch64 {
             x: [0; 31],
@@ -274,6 +337,8 @@ impl Aarch64 {
             vr: [0; 32],
             log_undef: std::env::var_os("RUVM_LOG_UNDEF").is_some(),
             last_insn: 0,
+            recheck: false,
+            bitmask_cache: vec![(0, None); 256],
         }
     }
 
@@ -303,6 +368,7 @@ impl Aarch64 {
         if r == 31 { self.sp = v } else { self.x[r] = v }
     }
 
+    #[inline(always)]
     fn set_flags(&mut self, f: (bool, bool, bool, bool)) {
         self.n = f.0;
         self.z = f.1;
@@ -310,10 +376,12 @@ impl Aarch64 {
         self.v = f.3;
     }
 
+    #[inline(always)]
     fn nzcv(&self) -> u64 {
         ((self.n as u64) << 31) | ((self.z as u64) << 30) | ((self.c as u64) << 29) | ((self.v as u64) << 28)
     }
 
+    #[inline(always)]
     fn cond(&self, c: u32) -> bool {
         let r = match c >> 1 {
             0 => self.z,
@@ -330,7 +398,7 @@ impl Aarch64 {
 
     /// DFSC 0x10 = synchronous external abort; bit 6 (WnR) marks writes.
     fn abort(&self, addr: u64, write: bool) -> Ex {
-        Ex::Sync { ec: EC_DABORT_LOWER, iss: 0x10 | (write as u32) << 6, far: Some(addr), next: false }
+        Ex::sync(EC_DABORT_LOWER, 0x10 | (write as u32) << 6, Some(addr), false)
     }
     /// Recompute timer interrupt lines (PPI 30 = physical, PPI 27 = virtual) and the
     /// next time anything about them changes.
@@ -392,6 +460,7 @@ impl Aarch64 {
     }
 
     fn sysreg_write(&mut self, bus: &mut Bus, key: u32, v: u64) {
+        self.recheck = true;
         let now = bus.clint.mtime;
         match key {
             SYS_NZCV => self.set_flags((v >> 31 & 1 == 1, v >> 30 & 1 == 1, v >> 29 & 1 == 1, v >> 28 & 1 == 1)),
@@ -457,8 +526,23 @@ impl Aarch64 {
         Ok(())
     }
 
+    /// `decode_bitmasks` through a small direct-mapped cache (logical immediates and
+    /// bitfield moves decode the same few patterns over and over).
+    #[inline(always)]
+    fn cached_bitmasks(&mut self, n: u32, imms: u32, immr: u32, immediate: bool, datasize: u32) -> Option<(u64, u64)> {
+        let key = 1 + (n | imms << 1 | immr << 7 | (immediate as u32) << 13 | (datasize >> 5) << 14);
+        let slot = (key as usize ^ (key as usize >> 6)) & 255;
+        let (k, r) = self.bitmask_cache[slot];
+        if k == key {
+            return r;
+        }
+        let r = decode_bitmasks(n, imms, immr, immediate, datasize);
+        self.bitmask_cache[slot] = (key, r);
+        r
+    }
+
     fn undef(&self, _i: u32) -> Ex {
-        Ex::Sync { ec: EC_UNKNOWN, iss: 0, far: None, next: false }
+        Ex::sync(EC_UNKNOWN, 0, None, false)
     }
 
     /// SPSR value describing the current PSTATE.
@@ -529,6 +613,7 @@ impl Aarch64 {
     }
 
     #[allow(clippy::too_many_arguments)]
+    #[inline(always)]
     fn addsub(&mut self, rd: usize, a: u64, b: u64, sub: bool, s: bool, sf: bool, rd_sp: bool) {
         let (res, fl) = if sub { awc(a, !b, true, sf) } else { awc(a, b, false, sf) };
         if s {
@@ -538,6 +623,7 @@ impl Aarch64 {
     }
 
     /// Single-register load/store; `opc`/`size` come from the instruction word.
+    #[inline(always)]
     fn ldst(&mut self, bus: &mut Bus, i: u32, addr: u64) -> Result<(), Ex> {
         let size = i >> 30;
         let opc = (i >> 22) & 3;
@@ -670,6 +756,7 @@ impl Aarch64 {
         Ok(())
     }
 
+    #[inline(never)]
     fn exec(&mut self, bus: &mut Bus) -> Result<(), Ex> {
         let pc = self.pc;
         let i = self.fetch(bus)?;
@@ -681,6 +768,8 @@ impl Aarch64 {
         let rn = ((i >> 5) & 31) as usize;
         let rm = ((i >> 16) & 31) as usize;
 
+        let class = (i >> 25) & 0xf;
+        if class >> 1 == 0b100 {
         if (i >> 23) & 0x3f == 0b100101 {
             // ---- MOVN / MOVZ / MOVK
             let opc = (i >> 29) & 3;
@@ -721,7 +810,7 @@ impl Aarch64 {
             if !sf && n == 1 {
                 return Err(self.undef(i));
             }
-            let (wmask, _) = decode_bitmasks(n, (i >> 10) & 0x3f, (i >> 16) & 0x3f, true, if sf { 64 } else { 32 })
+            let (wmask, _) = self.cached_bitmasks(n, (i >> 10) & 0x3f, (i >> 16) & 0x3f, true, if sf { 64 } else { 32 })
                 .ok_or_else(|| self.undef(i))?;
             let a = self.rz(rn);
             let res = match opc {
@@ -744,7 +833,7 @@ impl Aarch64 {
             if (sf as u32) != n {
                 return Err(self.undef(i));
             }
-            let (wmask, tmask) = decode_bitmasks(n, imms, immr, false, ds).ok_or_else(|| self.undef(i))?;
+            let (wmask, tmask) = self.cached_bitmasks(n, imms, immr, false, ds).ok_or_else(|| self.undef(i))?;
             let src = if sf { self.rz(rn) } else { self.rz(rn) as u32 as u64 };
             let rot = ror(src, immr, ds);
             let res = match opc {
@@ -770,7 +859,216 @@ impl Aarch64 {
                 (((self.rz(rn) as u32 as u64) << 32 | self.rz(rm) as u32 as u64) >> (lsb & 31)) as u32 as u64
             };
             self.wz(rd, res, sf);
-        } else if (i >> 24) & 0x1f == 0b01011 {
+        } else {
+            return Err(self.undef(i));
+        }
+        } else if class >> 1 == 0b101 {
+        if i >> 26 == 0b000101 || i >> 26 == 0b100101 {
+            // ---- B / BL
+            if i >> 31 == 1 {
+                self.x[30] = next;
+            }
+            next = pc.wrapping_add(sext((i & 0x03ff_ffff) as u64, 26) << 2);
+        } else if i >> 24 == 0x54 && i & 0x10 == 0 {
+            // ---- B.cond
+            if self.cond(i & 0xf) {
+                next = pc.wrapping_add(sext(((i >> 5) & 0x7ffff) as u64, 19) << 2);
+            }
+        } else if (i >> 25) & 0x3f == 0b011010 {
+            // ---- CBZ / CBNZ
+            let v = self.rz(rd);
+            let v = if sf { v } else { v as u32 as u64 };
+            if (v == 0) != ((i >> 24) & 1 == 1) {
+                next = pc.wrapping_add(sext(((i >> 5) & 0x7ffff) as u64, 19) << 2);
+            }
+        } else if (i >> 25) & 0x3f == 0b011011 {
+            // ---- TBZ / TBNZ
+            let bit = ((i >> 31) << 5) | ((i >> 19) & 0x1f);
+            let set = (self.rz(rd) >> bit) & 1 == 1;
+            if set == ((i >> 24) & 1 == 1) {
+                next = pc.wrapping_add(sext(((i >> 5) & 0x3fff) as u64, 14) << 2);
+            }
+        } else if matches!(i & 0xffff_fc1f, 0xd61f_0000 | 0xd63f_0000 | 0xd65f_0000) {
+            // ---- BR / BLR / RET
+            let target = self.rz(rn);
+            if i & 0xffff_fc1f == 0xd63f_0000 {
+                self.x[30] = next;
+            }
+            next = target;
+        } else if i & 0xffff_f0ff == 0xd503_305f {
+            self.excl = None; // CLREX
+        } else if i == 0xd503_207f {
+            // ---- WFI: sleep until the next interrupt or timer deadline
+            if !bus.gic.irq_line {
+                bus.idle(self.timer_deadline);
+            }
+        } else if i & 0xfffff01f == 0xd503201f || i & 0xfffff01f == 0xd503301f {
+            // ---- NOP / hints (WFE, YIELD...) / barriers
+        } else if i & 0xfff8f01f == 0xd500401f {
+            // ---- MSR (immediate): DAIFSet / DAIFClr / SPSel; others (PAN, UAO...) ignored
+            self.recheck = true;
+            let (op1, op2, crm) = ((i >> 16) & 7, (i >> 5) & 7, (i >> 8) & 15);
+            match (op1, op2) {
+                (3, 6) | (3, 7) | (0, 5) if self.el == 0 => return Err(self.undef(i)),
+                (3, 6) => self.daif |= crm,
+                (3, 7) => self.daif &= !crm,
+                (0, 5) => self.set_mode(self.el, crm & 1 == 1),
+                _ => {}
+            }
+        } else if i & 0xfff8_0000 == 0xd508_0000 {
+            self.sys_insn(bus, i)?;
+        } else if i & 0xffd0_0000 == 0xd510_0000 {
+            // ---- MRS / MSR (register)
+            let key = (i >> 5) & 0x7fff;
+            if self.el == 0 && (key >> 11) & 7 != 3 {
+                return Err(self.undef(i)); // only op1 = 3 (EL0-accessible) registers
+            }
+            if (i >> 21) & 1 == 1 {
+                let v = self.sysreg_read(bus, key);
+                self.wz(rd, v, true);
+            } else {
+                let v = self.rz(rd);
+                self.sysreg_write(bus, key, v);
+            }
+        } else if i == 0xd69f_03e0 {
+            // ---- ERET
+            if self.el == 0 {
+                return Err(self.undef(i));
+            }
+            let spsr = self.sysreg(SYS_SPSR_EL1);
+            self.set_flags((spsr >> 31 & 1 == 1, spsr >> 30 & 1 == 1, spsr >> 29 & 1 == 1, spsr >> 28 & 1 == 1));
+            self.daif = (spsr >> 6) as u32 & 0xf;
+            self.set_mode(((spsr >> 2) & 3).min(1) as u32, spsr & 1 == 1);
+            self.excl = None;
+            self.recheck = true;
+            next = self.sysreg(SYS_ELR_EL1);
+        } else if i & 0xffe0_001f == 0xd400_0001 {
+            // ---- SVC: exception to EL1, or a Linux-style host syscall (x8) while VBAR_EL1 = 0
+            if self.sysreg(SYS_VBAR_EL1) != 0 {
+                return Err(Ex::sync(EC_SVC64, (i >> 5) & 0xffff, None, true));
+            }
+            match host::syscall(bus, self.x[8], [self.x[0], self.x[1], self.x[2]]) {
+                Host::Exit(c) => return Err(Stop::Halt(c).into()),
+                Host::Ret(v) => self.x[0] = v,
+            }
+        } else if i & 0xffe0_001f == 0xd400_0002 || i & 0xffe0_001f == 0xd400_0003 {
+            // ---- HVC / SMC: PSCI
+            if self.el == 0 {
+                return Err(self.undef(i));
+            }
+            self.x[0] = match self.x[0] as u32 {
+                0x8400_0008 => return Err(Stop::Halt(0).into()), // SYSTEM_OFF
+                0x8400_0009 => return Err(Stop::Reset.into()),   // SYSTEM_RESET
+                0x8400_0000 => 0x0001_0000,                                     // PSCI_VERSION 1.0
+                _ => (-1i64) as u64,                                            // NOT_SUPPORTED
+            };
+        } else if i & 0xffe0_001f == 0xd440_0000 {
+            // ---- HLT: stop the VM, exit code = x0
+            return Err(Stop::Halt(self.x[0] as i32).into());
+        } else if i & 0xffe0_001f == 0xd420_0000 {
+            // ---- BRK
+            return Err(Ex::sync(EC_BRK, (i >> 5) & 0xffff, None, false));
+        } else {
+            return Err(self.undef(i));
+        }
+        } else if class & 0b0101 == 0b0100 {
+        if i & 0x3f20_0c00 == 0x3820_0000 {
+            // ---- LSE atomics: LDADD/LDCLR/LDEOR/LDSET/LD{S,U}{MAX,MIN}, SWP, LDAPR
+            self.atomic(bus, i)?;
+        } else if i & 0x3a00_0000 == 0x3800_0000 {
+            // ---- LDR/STR family (single register, integer or SIMD&FP)
+            let fp = (i >> 26) & 1 == 1;
+            // SIMD&FP 128-bit accesses are scaled by 16
+            let size = if fp && (i >> 23) & 1 == 1 && i >> 30 == 0 { 4 } else { i >> 30 };
+            let base = self.rs(rn);
+            if (i >> 24) & 1 == 1 {
+                let addr = base.wrapping_add((((i >> 10) & 0xfff) as u64) << size);
+                if fp { self.fp_ldst(bus, i, addr)? } else { self.ldst(bus, i, addr)? };
+            } else if (i >> 21) & 1 == 0 {
+                let imm9 = sext(((i >> 12) & 0x1ff) as u64, 9);
+                let (addr, wb) = match (i >> 10) & 3 {
+                    0 => (base.wrapping_add(imm9), None),
+                    1 => (base, Some(base.wrapping_add(imm9))),
+                    3 => (base.wrapping_add(imm9), Some(base.wrapping_add(imm9))),
+                    _ => (base.wrapping_add(imm9), None), // LDTR / STTR: EL0 permissions
+                };
+                self.unpriv = (i >> 10) & 3 == 2;
+                let r = if fp { self.fp_ldst(bus, i, addr) } else { self.ldst(bus, i, addr) };
+                self.unpriv = false;
+                r?;
+                if let Some(w) = wb {
+                    self.ws(rn, w, true);
+                }
+            } else if (i >> 10) & 3 == 2 {
+                let mut off = extend(self.rz(rm), (i >> 13) & 7);
+                if (i >> 12) & 1 == 1 {
+                    off <<= size;
+                }
+                let addr = base.wrapping_add(off);
+                if fp { self.fp_ldst(bus, i, addr)? } else { self.ldst(bus, i, addr)? };
+            } else {
+                return Err(self.undef(i));
+            }
+        } else if i & 0x3f00_0000 == 0x0800_0000 {
+            // ---- load/store exclusive, acquire/release, CAS
+            self.exclusive(bus, i)?;
+        } else if i & 0x3e00_0000 == 0x2c00_0000 {
+            self.fp_pair(bus, i)?; // LDP / STP (SIMD&FP)
+        } else if i & 0xbf00_0000 == 0x0c00_0000 || i & 0xbf00_0000 == 0x0d00_0000 {
+            self.simd_structure(bus, i)?; // LD1-LD4 / ST1-ST4
+        } else if i & 0x3f00_0000 == 0x1c00_0000 {
+            self.fp_literal(bus, i)?; // LDR (literal), SIMD&FP
+        } else if i & 0x3e00_0000 == 0x2800_0000 {
+            // ---- LDP / STP / LDPSW
+            let opc = i >> 30;
+            if opc == 3 {
+                return Err(self.undef(i));
+            }
+            let load = (i >> 22) & 1 == 1;
+            let scale = if opc == 2 { 3 } else { 2 };
+            let off = sext(((i >> 15) & 0x7f) as u64, 7) << scale;
+            let rt2 = ((i >> 10) & 31) as usize;
+            let base = self.rs(rn);
+            let (addr, wb) = match (i >> 23) & 3 {
+                1 => (base, Some(base.wrapping_add(off))),
+                0 | 2 => (base.wrapping_add(off), None), // 0 = STNP / LDNP (non-temporal hint ignored)
+                _ => (base.wrapping_add(off), Some(base.wrapping_add(off))),
+            };
+            let n = 1usize << scale;
+            if load {
+                let (mut v1, mut v2) = (self.rd(bus, addr, n)?, self.rd(bus, addr.wrapping_add(n as u64), n)?);
+                if opc == 1 {
+                    v1 = sext(v1, 32);
+                    v2 = sext(v2, 32);
+                }
+                self.wz(rd, v1, true);
+                self.wz(rt2, v2, true);
+            } else {
+                let (v1, v2) = (self.rz(rd), self.rz(rt2));
+                self.wr(bus, addr, n, v1)?;
+                self.wr(bus, addr.wrapping_add(n as u64), n, v2)?;
+            }
+            if let Some(w) = wb {
+                self.ws(rn, w, true);
+            }
+        } else if i & 0x3f00_0000 == 0x1800_0000 {
+            // ---- LDR (literal)
+            let opc = i >> 30;
+            let addr = pc.wrapping_add(sext(((i >> 5) & 0x7ffff) as u64, 19) << 2);
+            let v = match opc {
+                0 => self.rd(bus, addr, 4)?,
+                1 => self.rd(bus, addr, 8)?,
+                2 => sext(self.rd(bus, addr, 4)?, 32),
+                _ => 0, // PRFM
+            };
+            if opc != 3 {
+                self.wz(rd, v, true);
+            }
+        } else {
+            return Err(self.undef(i));
+        }
+        } else if class & 7 == 0b101 {
+        if (i >> 24) & 0x1f == 0b01011 {
             // ---- ADD/SUB (shifted or extended register)
             let sub = (i >> 30) & 1 == 1;
             let s = (i >> 29) & 1 == 1;
@@ -896,203 +1194,11 @@ impl Aarch64 {
                 _ => return Err(self.undef(i)),
             };
             self.wz(rd, res, sf);
-        } else if i >> 26 == 0b000101 || i >> 26 == 0b100101 {
-            // ---- B / BL
-            if i >> 31 == 1 {
-                self.x[30] = next;
-            }
-            next = pc.wrapping_add(sext((i & 0x03ff_ffff) as u64, 26) << 2);
-        } else if i >> 24 == 0x54 && i & 0x10 == 0 {
-            // ---- B.cond
-            if self.cond(i & 0xf) {
-                next = pc.wrapping_add(sext(((i >> 5) & 0x7ffff) as u64, 19) << 2);
-            }
-        } else if (i >> 25) & 0x3f == 0b011010 {
-            // ---- CBZ / CBNZ
-            let v = self.rz(rd);
-            let v = if sf { v } else { v as u32 as u64 };
-            if (v == 0) != ((i >> 24) & 1 == 1) {
-                next = pc.wrapping_add(sext(((i >> 5) & 0x7ffff) as u64, 19) << 2);
-            }
-        } else if (i >> 25) & 0x3f == 0b011011 {
-            // ---- TBZ / TBNZ
-            let bit = ((i >> 31) << 5) | ((i >> 19) & 0x1f);
-            let set = (self.rz(rd) >> bit) & 1 == 1;
-            if set == ((i >> 24) & 1 == 1) {
-                next = pc.wrapping_add(sext(((i >> 5) & 0x3fff) as u64, 14) << 2);
-            }
-        } else if matches!(i & 0xffff_fc1f, 0xd61f_0000 | 0xd63f_0000 | 0xd65f_0000) {
-            // ---- BR / BLR / RET
-            let target = self.rz(rn);
-            if i & 0xffff_fc1f == 0xd63f_0000 {
-                self.x[30] = next;
-            }
-            next = target;
-        } else if i & 0x3f00_0000 == 0x0800_0000 {
-            // ---- load/store exclusive, acquire/release, CAS
-            self.exclusive(bus, i)?;
-        } else if i & 0x3f20_0c00 == 0x3820_0000 {
-            // ---- LSE atomics: LDADD/LDCLR/LDEOR/LDSET/LD{S,U}{MAX,MIN}, SWP, LDAPR
-            self.atomic(bus, i)?;
-        } else if i & 0x3a00_0000 == 0x3800_0000 {
-            // ---- LDR/STR family (single register, integer or SIMD&FP)
-            let fp = (i >> 26) & 1 == 1;
-            // SIMD&FP 128-bit accesses are scaled by 16
-            let size = if fp && (i >> 23) & 1 == 1 && i >> 30 == 0 { 4 } else { i >> 30 };
-            let base = self.rs(rn);
-            if (i >> 24) & 1 == 1 {
-                let addr = base.wrapping_add((((i >> 10) & 0xfff) as u64) << size);
-                if fp { self.fp_ldst(bus, i, addr)? } else { self.ldst(bus, i, addr)? };
-            } else if (i >> 21) & 1 == 0 {
-                let imm9 = sext(((i >> 12) & 0x1ff) as u64, 9);
-                let (addr, wb) = match (i >> 10) & 3 {
-                    0 => (base.wrapping_add(imm9), None),
-                    1 => (base, Some(base.wrapping_add(imm9))),
-                    3 => (base.wrapping_add(imm9), Some(base.wrapping_add(imm9))),
-                    _ => (base.wrapping_add(imm9), None), // LDTR / STTR: EL0 permissions
-                };
-                self.unpriv = (i >> 10) & 3 == 2;
-                let r = if fp { self.fp_ldst(bus, i, addr) } else { self.ldst(bus, i, addr) };
-                self.unpriv = false;
-                r?;
-                if let Some(w) = wb {
-                    self.ws(rn, w, true);
-                }
-            } else if (i >> 10) & 3 == 2 {
-                let mut off = extend(self.rz(rm), (i >> 13) & 7);
-                if (i >> 12) & 1 == 1 {
-                    off <<= size;
-                }
-                let addr = base.wrapping_add(off);
-                if fp { self.fp_ldst(bus, i, addr)? } else { self.ldst(bus, i, addr)? };
-            } else {
-                return Err(self.undef(i));
-            }
-        } else if i & 0x3e00_0000 == 0x2c00_0000 {
-            self.fp_pair(bus, i)?; // LDP / STP (SIMD&FP)
-        } else if i & 0xbf00_0000 == 0x0c00_0000 || i & 0xbf00_0000 == 0x0d00_0000 {
-            self.simd_structure(bus, i)?; // LD1-LD4 / ST1-ST4
-        } else if i & 0x3f00_0000 == 0x1c00_0000 {
-            self.fp_literal(bus, i)?; // LDR (literal), SIMD&FP
-        } else if i & 0x3e00_0000 == 0x2800_0000 {
-            // ---- LDP / STP / LDPSW
-            let opc = i >> 30;
-            if opc == 3 {
-                return Err(self.undef(i));
-            }
-            let load = (i >> 22) & 1 == 1;
-            let scale = if opc == 2 { 3 } else { 2 };
-            let off = sext(((i >> 15) & 0x7f) as u64, 7) << scale;
-            let rt2 = ((i >> 10) & 31) as usize;
-            let base = self.rs(rn);
-            let (addr, wb) = match (i >> 23) & 3 {
-                1 => (base, Some(base.wrapping_add(off))),
-                0 | 2 => (base.wrapping_add(off), None), // 0 = STNP / LDNP (non-temporal hint ignored)
-                _ => (base.wrapping_add(off), Some(base.wrapping_add(off))),
-            };
-            let n = 1usize << scale;
-            if load {
-                let (mut v1, mut v2) = (self.rd(bus, addr, n)?, self.rd(bus, addr.wrapping_add(n as u64), n)?);
-                if opc == 1 {
-                    v1 = sext(v1, 32);
-                    v2 = sext(v2, 32);
-                }
-                self.wz(rd, v1, true);
-                self.wz(rt2, v2, true);
-            } else {
-                let (v1, v2) = (self.rz(rd), self.rz(rt2));
-                self.wr(bus, addr, n, v1)?;
-                self.wr(bus, addr.wrapping_add(n as u64), n, v2)?;
-            }
-            if let Some(w) = wb {
-                self.ws(rn, w, true);
-            }
-        } else if i & 0x3f00_0000 == 0x1800_0000 {
-            // ---- LDR (literal)
-            let opc = i >> 30;
-            let addr = pc.wrapping_add(sext(((i >> 5) & 0x7ffff) as u64, 19) << 2);
-            let v = match opc {
-                0 => self.rd(bus, addr, 4)?,
-                1 => self.rd(bus, addr, 8)?,
-                2 => sext(self.rd(bus, addr, 4)?, 32),
-                _ => 0, // PRFM
-            };
-            if opc != 3 {
-                self.wz(rd, v, true);
-            }
-        } else if i & 0xffff_f0ff == 0xd503_305f {
-            self.excl = None; // CLREX
-        } else if i == 0xd503_207f {
-            // ---- WFI: sleep until the next interrupt or timer deadline
-            if !bus.gic.irq_line {
-                bus.idle(self.timer_deadline);
-            }
-        } else if i & 0xfffff01f == 0xd503201f || i & 0xfffff01f == 0xd503301f {
-            // ---- NOP / hints (WFE, YIELD...) / barriers
-        } else if i & 0xfff8f01f == 0xd500401f {
-            // ---- MSR (immediate): DAIFSet / DAIFClr / SPSel; others (PAN, UAO...) ignored
-            let (op1, op2, crm) = ((i >> 16) & 7, (i >> 5) & 7, (i >> 8) & 15);
-            match (op1, op2) {
-                (3, 6) | (3, 7) | (0, 5) if self.el == 0 => return Err(self.undef(i)),
-                (3, 6) => self.daif |= crm,
-                (3, 7) => self.daif &= !crm,
-                (0, 5) => self.set_mode(self.el, crm & 1 == 1),
-                _ => {}
-            }
-        } else if i & 0xfff8_0000 == 0xd508_0000 {
-            self.sys_insn(bus, i)?;
-        } else if i & 0xffd0_0000 == 0xd510_0000 {
-            // ---- MRS / MSR (register)
-            let key = (i >> 5) & 0x7fff;
-            if self.el == 0 && (key >> 11) & 7 != 3 {
-                return Err(self.undef(i)); // only op1 = 3 (EL0-accessible) registers
-            }
-            if (i >> 21) & 1 == 1 {
-                let v = self.sysreg_read(bus, key);
-                self.wz(rd, v, true);
-            } else {
-                let v = self.rz(rd);
-                self.sysreg_write(bus, key, v);
-            }
-        } else if i == 0xd69f_03e0 {
-            // ---- ERET
-            if self.el == 0 {
-                return Err(self.undef(i));
-            }
-            let spsr = self.sysreg(SYS_SPSR_EL1);
-            self.set_flags((spsr >> 31 & 1 == 1, spsr >> 30 & 1 == 1, spsr >> 29 & 1 == 1, spsr >> 28 & 1 == 1));
-            self.daif = (spsr >> 6) as u32 & 0xf;
-            self.set_mode(((spsr >> 2) & 3).min(1) as u32, spsr & 1 == 1);
-            self.excl = None;
-            next = self.sysreg(SYS_ELR_EL1);
-        } else if i & 0xffe0_001f == 0xd400_0001 {
-            // ---- SVC: exception to EL1, or a Linux-style host syscall (x8) while VBAR_EL1 = 0
-            if self.sysreg(SYS_VBAR_EL1) != 0 {
-                return Err(Ex::Sync { ec: EC_SVC64, iss: (i >> 5) & 0xffff, far: None, next: true });
-            }
-            match host::syscall(bus, self.x[8], [self.x[0], self.x[1], self.x[2]]) {
-                Host::Exit(c) => return Err(Stop::Halt(c).into()),
-                Host::Ret(v) => self.x[0] = v,
-            }
-        } else if i & 0xffe0_001f == 0xd400_0002 || i & 0xffe0_001f == 0xd400_0003 {
-            // ---- HVC / SMC: PSCI
-            if self.el == 0 {
-                return Err(self.undef(i));
-            }
-            self.x[0] = match self.x[0] as u32 {
-                0x8400_0008 => return Err(Stop::Halt(0).into()), // SYSTEM_OFF
-                0x8400_0009 => return Err(Stop::Reset.into()),   // SYSTEM_RESET
-                0x8400_0000 => 0x0001_0000,                                     // PSCI_VERSION 1.0
-                _ => (-1i64) as u64,                                            // NOT_SUPPORTED
-            };
-        } else if i & 0xffe0_001f == 0xd440_0000 {
-            // ---- HLT: stop the VM, exit code = x0
-            return Err(Stop::Halt(self.x[0] as i32).into());
-        } else if (i >> 25) & 7 == 7 {
+        } else {
+            return Err(self.undef(i));
+        }
+        } else if class & 7 == 7 {
             self.fpsimd(bus, i)?; // scalar FP and Advanced SIMD data processing
-        } else if i & 0xffe0_001f == 0xd420_0000 {
-            // ---- BRK
-            return Err(Ex::Sync { ec: EC_BRK, iss: (i >> 5) & 0xffff, far: None, next: false });
         } else {
             return Err(self.undef(i));
         }
@@ -1122,36 +1228,51 @@ impl Cpu for Aarch64 {
         self.pc = pc;
     }
     fn step(&mut self, bus: &mut Bus) -> Result<(), Stop> {
-        if bus.clint.mtime >= self.timer_deadline {
-            self.update_timers(bus);
-        }
-        if bus.gic.irq_line && self.daif & 2 == 0 && self.sysreg(SYS_VBAR_EL1) != 0 {
-            self.irq_exception();
+        if self.pre(bus) {
             return Ok(());
         }
         match self.exec(bus) {
             Ok(()) => Ok(()),
-            Err(Ex::Stop(s)) => Err(s),
-            Err(Ex::Sync { ec, iss, far, next }) => {
-                if self.sysreg(SYS_VBAR_EL1) == 0 {
-                    let i = bus.read(self.pc, 4).unwrap_or(0);
-                    return Err(Stop::Fatal(match ec {
-                        EC_UNKNOWN => format!("undefined instruction {:#010x} at pc={:#x}", i, self.pc),
-                        EC_BRK => format!("BRK #{} at pc={:#x}", iss, self.pc),
-                        _ => format!(
-                            "unhandled exception EC={:#x} ISS={:#x} FAR={:#x} at pc={:#x} (data abort / bus error, VBAR_EL1 not set)",
-                            ec, iss, far.unwrap_or(0), self.pc
-                        ),
-                    }));
+            Err(e) => self.handle_ex(bus, e),
+        }
+    }
+
+    /// Batched execution: the per-instruction bookkeeping (board clock, timers, interrupt
+    /// line, halt flag) is done once per batch of up to `BATCH` instructions.
+    fn run(&mut self, bus: &mut Bus, n: u64) -> (u64, Option<Stop>) {
+        const BATCH: u64 = 32;
+        let mut done = 0;
+        while done < n {
+            let k = (n - done).min(BATCH);
+            bus.clint.mtime += k;
+            if self.pre(bus) {
+                done += 1;
+                continue;
+            }
+            let mut j = 0;
+            while j < k {
+                j += 1;
+                if let Err(e) = self.exec(bus) {
+                    if let Err(s) = self.handle_ex(bus, e) {
+                        return (done + j, Some(s));
+                    }
                 }
-                if ec == EC_UNKNOWN && self.log_undef {
-                    eprintln!("[undef] EL{} pc={:#x} insn={:08x}", self.el, self.pc, self.last_insn);
+                if self.recheck | bus.irq_dirty {
+                    break;
                 }
-                let ret = if next { self.pc.wrapping_add(4) } else { self.pc };
-                self.exception(ec, iss, far, ret);
-                Ok(())
+            }
+            self.recheck = false;
+            bus.irq_dirty = false;
+            bus.clint.mtime -= k - j; // give back the unused part of the batch
+            done += j;
+            if let Some(code) = bus.halt {
+                return (done, Some(Stop::Halt(code)));
+            }
+            if bus.reset {
+                break;
             }
         }
+        (done, None)
     }
     fn dump(&self) -> String {
         let mut s = format!("pc  = {:#018x}\n", self.pc);

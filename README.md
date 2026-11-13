@@ -8,6 +8,8 @@ trap delegation, Sv39 paging, the C extension, CLINT timer/software interrupts a
 a PLIC; AArch64 EL0/EL1 exceptions, exclusives and LSE atomics. Both are checked
 instruction-for-instruction against `qemu-system-*` (see [doc/v0.2.md](doc/v0.2.md)).
 
+**v0.8** is a speed pass with honest numbers (~120 MIPS; [doc/v0.8.md](doc/v0.8.md), `tools/bench.sh`).
+
 **v0.7: a usable system** — ext4 root on virtio-blk, virtio-rng, RTC, real reboot; both architectures
 boot from a disk image, write to it and keep the data across a reboot ([doc/v0.7.md](doc/v0.7.md)):
 

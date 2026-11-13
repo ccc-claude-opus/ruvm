@@ -174,6 +174,10 @@ pub struct Riscv64 {
     /// Built-in SBI firmware: `ecall` from S-mode is served by the emulator
     /// (set by `boot_supervisor`; with `-bios <file>` the real firmware does it).
     sbi: bool,
+    /// All 65536 compressed encodings expanded to 32-bit instructions (0 = illegal).
+    rvc_table: Box<[u32]>,
+    /// Interrupt-relevant state changed: end the current batch so `pre` runs again.
+    recheck: bool,
 }
 
 #[inline]
@@ -182,6 +186,38 @@ fn sx32(v: u32) -> u64 {
 }
 
 impl Riscv64 {
+    /// Sample time and interrupt lines and take a pending interrupt, between instructions.
+    #[inline(always)]
+    fn pre(&mut self, bus: &mut Bus) -> Result<(), Stop> {
+        self.time = bus.clint.mtime;
+        self.hw_ip = (bus.clint.mtip() as u64) << 7
+            | (bus.clint.msip as u64) << 3
+            | (bus.plic.out[0] as u64) << 11
+            | (bus.plic.out[1] as u64) << 9;
+        if self.csr[MENVCFG] >> 63 == 1 && self.time >= self.csr[STIMECMP] {
+            self.hw_ip |= STI; // Sstc
+        }
+        if let Some(code) = self.pending_interrupt() {
+            self.take_trap(INTERRUPT | code, 0)?;
+        }
+        Ok(())
+    }
+
+    /// An instruction raised a trap (or stopped the machine).
+    #[cold]
+    #[inline(never)]
+    fn handle_ex(&mut self, bus: &mut Bus, e: Ex) -> Result<(), Stop> {
+        match e {
+            Ex::Stop(s) => Err(s),
+            Ex::Trap(cause, _) if self.sbi && cause == ECALL_U + PRV_S => {
+                self.sbi_call(bus)?;
+                self.pc += 4;
+                Ok(())
+            }
+            Ex::Trap(cause, tval) => self.take_trap(cause, tval),
+        }
+    }
+
     pub fn new() -> Self {
         let mut csr = vec![0u64; 4096];
         // RV64 (MXL=2), extensions A C D F I M S U
@@ -204,6 +240,8 @@ impl Riscv64 {
             fetch_vpn: 0,
             fetch_off: 0,
             sbi: false,
+            recheck: false,
+            rvc_table: (0..=u16::MAX).map(|c| rvc::expand(c).unwrap_or(0)).collect(),
         }
     }
 
@@ -422,6 +460,7 @@ impl Riscv64 {
     }
 
     fn csr_op(&mut self, i: u32, rd: usize, rs1: usize, f3: u32) -> Result<(), Ex> {
+        self.recheck = true;
         let a = (i >> 20) as usize;
         let illegal = Ex::Trap(ILLEGAL, i as u64);
         let src = if f3 >= 5 { rs1 as u64 } else { self.x[rs1] };
@@ -635,7 +674,10 @@ impl Riscv64 {
             let off = self.fetch_off + po;
             let w = u32::from_le_bytes(bus.ram()[off..off + 4].try_into().unwrap());
             if w & 3 != 3 {
-                let i = rvc::expand_fast(w as u16).ok_or(Ex::Trap(ILLEGAL, (w & 0xffff) as u64))?;
+                let i = self.rvc_table[(w & 0xffff) as usize];
+                if i == 0 {
+                    return Err(Ex::Trap(ILLEGAL, (w & 0xffff) as u64));
+                }
                 return Ok((i, 2));
             }
             return Ok((w, 4));
@@ -647,7 +689,10 @@ impl Riscv64 {
         }
         let lo = bus.read(pa, 2).map_err(|_| Ex::Trap(INSN_ACCESS, pc))? as u32;
         if lo & 3 != 3 {
-            let i = rvc::expand_fast(lo as u16).ok_or(Ex::Trap(ILLEGAL, lo as u64))?;
+            let i = self.rvc_table[lo as u16 as usize];
+            if i == 0 {
+                return Err(Ex::Trap(ILLEGAL, lo as u64));
+            }
             return Ok((i, 2));
         }
         let hi_va = pc.wrapping_add(2);
@@ -658,6 +703,7 @@ impl Riscv64 {
 
     // ------------------------------------------------------------------ execute
 
+    #[inline(never)]
     fn exec(&mut self, bus: &mut Bus) -> Result<(), Ex> {
         let pc = self.pc;
         let (i, len) = self.fetch(bus)?;
@@ -840,6 +886,7 @@ impl Riscv64 {
                             ns &= !MS_MPRV;
                         }
                         self.csr[MSTATUS] = ns;
+                        self.recheck = true;
                         self.prv = mpp;
                         self.fetch_vpn = 0;
                         next = self.csr[MEPC];
@@ -853,6 +900,7 @@ impl Riscv64 {
                         let spp = (ms >> 8) & 1;
                         let sie = if ms & MS_SPIE != 0 { MS_SIE } else { 0 };
                         self.csr[MSTATUS] = (ms & !(MS_SIE | MS_SPP | MS_MPRV)) | sie | MS_SPIE;
+                        self.recheck = true;
                         self.prv = spp;
                         self.fetch_vpn = 0;
                         next = self.csr[SEPC];
@@ -1096,27 +1144,51 @@ impl Cpu for Riscv64 {
 
     fn step(&mut self, bus: &mut Bus) -> Result<(), Stop> {
         self.insns += 1;
-        self.time = bus.clint.mtime;
-        self.hw_ip = (bus.clint.mtip() as u64) << 7
-            | (bus.clint.msip as u64) << 3
-            | (bus.plic.out[0] as u64) << 11
-            | (bus.plic.out[1] as u64) << 9;
-        if self.csr[MENVCFG] >> 63 == 1 && self.time >= self.csr[STIMECMP] {
-            self.hw_ip |= STI; // Sstc
-        }
-        if let Some(code) = self.pending_interrupt() {
-            self.take_trap(INTERRUPT | code, 0)?;
-        }
+        self.pre(bus)?;
         match self.exec(bus) {
             Ok(()) => Ok(()),
-            Err(Ex::Stop(s)) => Err(s),
-            Err(Ex::Trap(cause, _)) if self.sbi && cause == ECALL_U + PRV_S => {
-                self.sbi_call(bus)?;
-                self.pc += 4;
-                Ok(())
-            }
-            Err(Ex::Trap(cause, tval)) => self.take_trap(cause, tval),
+            Err(e) => self.handle_ex(bus, e),
         }
+    }
+
+    /// Batched execution: board time, interrupt lines and the halt flag are examined once
+    /// per batch of up to `BATCH` instructions (interrupts are taken at batch boundaries).
+    fn run(&mut self, bus: &mut Bus, n: u64) -> (u64, Option<Stop>) {
+        const BATCH: u64 = 32;
+        let mut done = 0;
+        while done < n {
+            let k = (n - done).min(BATCH);
+            bus.clint.mtime += k;
+            self.insns += k;
+            if let Err(s) = self.pre(bus) {
+                return (done + 1, Some(s));
+            }
+            let mut j = 0;
+            while j < k {
+                j += 1;
+                if let Err(e) = self.exec(bus) {
+                    if let Err(s) = self.handle_ex(bus, e) {
+                        return (done + j, Some(s));
+                    }
+                }
+                if self.recheck | bus.irq_dirty {
+                    break;
+                }
+            }
+            self.recheck = false;
+            bus.irq_dirty = false;
+            // give back the unused part of the batch (board time and instret stay exact)
+            bus.clint.mtime -= k - j;
+            self.insns -= k - j;
+            done += j;
+            if let Some(code) = bus.halt {
+                return (done, Some(Stop::Halt(code)));
+            }
+            if bus.reset {
+                break;
+            }
+        }
+        (done, None)
     }
 
     fn dump(&self) -> String {
