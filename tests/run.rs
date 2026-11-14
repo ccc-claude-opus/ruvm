@@ -595,3 +595,22 @@ fn user_mode_busybox() {
         assert_eq!((c, o.as_str()), (0, "trapped\nafter\nrc=143\n"), "{arch}");
     }
 }
+
+/// Dynamically linked glibc programs: the loader and libc come from a Debian sysroot (`-L`), including
+/// fork + execve of another dynamic program. Needs `tools/linux/fetch-sysroot.sh`.
+#[test]
+#[ignore]
+fn user_mode_dynamic_linking() {
+    for arch in ["riscv64", "arm64"] {
+        let root = format!("{}/tests/guest/out/user/{arch}/sysroot", env!("CARGO_MANIFEST_DIR"));
+        let dash = format!("{root}/usr/bin/dash");
+        let script = "echo $((6*7)); echo a b | while read x y; do echo y=$y; done; /bin/sh -c 'echo nested'; exit 4";
+        let out = Command::new(env!("CARGO_BIN_EXE_ruvm")).args(["-L", &root, "-user", &dash, "-c", script]).output().unwrap();
+        assert_eq!(out.status.code(), Some(4), "{arch}: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(String::from_utf8_lossy(&out.stdout), "42\ny=b\nnested\n", "{arch}");
+        // without a sysroot the error says what is missing
+        let out = Command::new(env!("CARGO_BIN_EXE_ruvm")).args(["-user", &dash]).output().unwrap();
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("pass -L <sysroot>"), "{arch}");
+    }
+}

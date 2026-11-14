@@ -4,7 +4,8 @@
 //!
 //! Memory is one flat region starting at 64 KiB (so null-pointer accesses fault): the program at its link addresses,
 //! `brk` heap above it, `mmap` regions growing down from below the stack, and the stack at the top.
-//! Not supported: threads/`clone`/`fork`/`exec`, signals, dynamic linking, mapping of files shared with the guest.
+//! Dynamically linked programs run with `-L <sysroot>`: the ELF interpreter is loaded from there. Not supported:
+//! asynchronous signals, mapping of files shared with the guest.
 
 use crate::bus::Bus;
 use crate::machine::Arch;
@@ -12,7 +13,7 @@ use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::os::unix::io::FromRawFd;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -54,6 +55,8 @@ pub struct LinuxUser {
     pub signal_op: Option<SignalOp>,
     /// Address of the `rt_sigreturn` trampoline (`mov a7, 139; ecall`).
     tramp: u64,
+    /// Root for absolute guest paths that exist there (`-L`).
+    sysroot: Option<PathBuf>,
     /// Threads (index = CPU index in the machine); `cur` is the one that is running.
     threads: Vec<Thread>,
     pub cur: usize,
@@ -243,6 +246,7 @@ impl LinuxUser {
             pending: 0,
             signal_op: None,
             tramp: 0,
+            sysroot: None,
             threads: vec![Thread { tid: std::process::id(), state: ThState::Run, clear_tid: 0 }],
             cur: 0,
             live: 1,
@@ -349,7 +353,10 @@ impl LinuxUser {
     fn path(&self, bus: &Bus, dirfd: i64, p: u64) -> Result<PathBuf, i64> {
         let s = Self::cstr(bus, p).ok_or(EFAULT)?;
         let path = if s == "/proc/self/exe" { PathBuf::from(&self.exe) } else { PathBuf::from(s) };
-        if path.is_absolute() || dirfd == -100 {
+        if path.is_absolute() {
+            return Ok(in_sysroot(self.sysroot.as_deref(), path));
+        }
+        if dirfd == -100 {
             return Ok(path);
         }
         match self.fds.get(dirfd as usize) {
@@ -1196,7 +1203,7 @@ impl LinuxUser {
         }
         let mut nb = Bus::with_cpus(bus.ram_base(), bus.ram_size() as usize, 1);
         // a file that is not a guest executable (e.g. a host binary found on PATH) does not exist as far as the guest is concerned
-        let Ok(img) = load(&mut nb, self.arch, &file.to_string_lossy(), &data, &argv, &envp) else { return ENOENT };
+        let Ok(img) = load(&mut nb, self.arch, &file.to_string_lossy(), &data, &argv, &envp, self.sysroot.as_deref()) else { return ENOENT };
         let nu = nb.user.as_mut().unwrap();
         let keep: HashSet<usize> = (0..self.fds.len()).filter(|i| !self.cloexec.contains(i)).collect();
         nu.blocked = self.blocked;
@@ -1537,6 +1544,80 @@ impl LinuxUser {
     }
 }
 
+struct Elf {
+    entry: u64,
+    top: u64,
+    phdr: u64,
+    phentsize: usize,
+    phnum: usize,
+    interp: Option<String>,
+}
+
+/// Highest address (relative to the load bias) used by the PT_LOAD segments.
+fn elf_span(d: &[u8]) -> Result<u64, String> {
+    let u16_at = |o: usize| d.get(o..o + 2).map_or(0, |b| u16::from_le_bytes(b.try_into().unwrap()));
+    let u64_at = |o: usize| d.get(o..o + 8).map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
+    let (phoff, phentsize, phnum) = (u64_at(32) as usize, u16_at(54) as usize, u16_at(56) as usize);
+    let mut top = 0;
+    for k in 0..phnum {
+        let p = phoff + k * phentsize;
+        if d.get(p..p + 4) == Some(&[1, 0, 0, 0]) {
+            top = top.max(u64_at(p + 16) + u64_at(p + 40));
+        }
+    }
+    Ok(top)
+}
+
+/// Copy the PT_LOAD segments of an ELF64 file into guest memory at `bias`.
+fn map_elf(bus: &mut Bus, arch: Arch, d: &[u8], bias: u64) -> Result<Elf, String> {
+    let u16_at = |o: usize| d.get(o..o + 2).map_or(0, |b| u16::from_le_bytes(b.try_into().unwrap()));
+    let u32_at = |o: usize| d.get(o..o + 4).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()));
+    let u64_at = |o: usize| d.get(o..o + 8).map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
+    if d.len() < 64 || &d[..4] != b"\x7fELF" || d[4] != 2 || d[5] != 1 {
+        return Err("not a little-endian ELF64 file".into());
+    }
+    let want = if arch == Arch::Riscv64 { 243 } else { 183 };
+    if u16_at(18) != want {
+        return Err(format!("ELF e_machine {} does not match {:?}", u16_at(18), arch));
+    }
+    let (phoff, phentsize, phnum) = (u64_at(32) as usize, u16_at(54) as usize, u16_at(56) as usize);
+    let (mut top, mut phdr, mut interp) = (0u64, 0u64, None);
+    for k in 0..phnum {
+        let p = phoff + k * phentsize;
+        match u32_at(p) {
+            3 => {
+                let (off, len) = (u64_at(p + 8) as usize, u64_at(p + 32) as usize);
+                let raw = d.get(off..off + len).ok_or("truncated PT_INTERP")?;
+                interp = Some(String::from_utf8_lossy(raw.split(|&b| b == 0).next().unwrap_or(&[])).into_owned());
+            }
+            1 => {
+                let (off, vaddr, filesz, memsz) = (u64_at(p + 8) as usize, u64_at(p + 16) + bias, u64_at(p + 32) as usize, u64_at(p + 40));
+                if off.checked_add(filesz).map_or(true, |e| e > d.len()) {
+                    return Err("truncated ELF segment".into());
+                }
+                bus.load(vaddr, &d[off..off + filesz])?;
+                top = top.max(vaddr + memsz);
+                if off <= phoff && phoff < off + filesz {
+                    phdr = vaddr + (phoff - off) as u64;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(Elf { entry: u64_at(24) + bias, top, phdr, phentsize, phnum, interp })
+}
+
+/// An absolute guest path as seen through the sysroot: used when it exists there, else the host path.
+fn in_sysroot(root: Option<&Path>, p: PathBuf) -> PathBuf {
+    if let (Some(r), true) = (root, p.is_absolute()) {
+        let c = r.join(p.strip_prefix("/").unwrap_or(&p));
+        if c.symlink_metadata().is_ok() {
+            return c;
+        }
+    }
+    p
+}
+
 /// Enter a signal handler or return from one, as requested by the last system call.
 pub fn signal_step(bus: &mut Bus, arch: Arch, ctx: &mut UserCtx) -> Result<(), String> {
     let mut u = bus.user.take().ok_or("no user-mode state")?;
@@ -1553,39 +1634,25 @@ pub struct UserImage {
 
 /// Load a static ELF into the bus's RAM (which starts at address 0), build the Linux process
 /// stack (argc, argv, envp, auxv) and install the system-call emulation.
-pub fn load(bus: &mut Bus, arch: Arch, exe: &str, d: &[u8], argv: &[String], envp: &[String]) -> Result<UserImage, String> {
-    let u16_at = |o: usize| d.get(o..o + 2).map_or(0, |b| u16::from_le_bytes(b.try_into().unwrap()));
-    let u32_at = |o: usize| d.get(o..o + 4).map_or(0, |b| u32::from_le_bytes(b.try_into().unwrap()));
-    let u64_at = |o: usize| d.get(o..o + 8).map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
-    if d.len() < 64 || &d[..4] != b"\x7fELF" || d[4] != 2 || d[5] != 1 {
-        return Err("not a little-endian ELF64 file".into());
-    }
-    let want = if arch == Arch::Riscv64 { 243 } else { 183 };
-    if u16_at(18) != want {
-        return Err(format!("ELF e_machine {} does not match {:?}", u16_at(18), arch));
-    }
-    let bias: u64 = if u16_at(16) == 3 { 0x1000_0000 } else { 0 }; // ET_DYN (static-pie) is placed here
-    let (phoff, phentsize, phnum) = (u64_at(32) as usize, u16_at(54) as usize, u16_at(56) as usize);
-    let (mut top, mut phdr) = (0u64, 0u64);
-    for k in 0..phnum {
-        let p = phoff + k * phentsize;
-        match u32_at(p) {
-            3 => return Err("dynamically linked executables are not supported (build with -static)".into()),
-            1 => {
-                let (off, vaddr, filesz, memsz) = (u64_at(p + 8) as usize, u64_at(p + 16) + bias, u64_at(p + 32) as usize, u64_at(p + 40));
-                if off.checked_add(filesz).map_or(true, |e| e > d.len()) {
-                    return Err("truncated ELF segment".into());
-                }
-                bus.load(vaddr, &d[off..off + filesz])?;
-                top = top.max(vaddr + memsz);
-                if off <= phoff && phoff < off + filesz {
-                    phdr = vaddr + (phoff - off) as u64;
-                }
-            }
-            _ => {}
-        }
-    }
+pub fn load(bus: &mut Bus, arch: Arch, exe: &str, d: &[u8], argv: &[String], envp: &[String], sysroot: Option<&Path>) -> Result<UserImage, String> {
+    let bias: u64 = if d.get(16..18) == Some(&[3, 0]) { 0x1000_0000 } else { 0 }; // ET_DYN (PIE) is placed here
+    let main = map_elf(bus, arch, d, bias)?;
+    let (phdr, phentsize, phnum, top) = (main.phdr, main.phentsize, main.phnum, main.top);
     let ram_end = bus.ram_base() + bus.ram_size();
+    let mut stack_low = ram_end - STACK_SIZE - STACK_GAP;
+    let (mut entry, mut at_base) = (main.entry, 0);
+    if let Some(interp) = &main.interp {
+        // dynamic executable: the dynamic loader (from the sysroot) runs first and maps the libraries itself
+        let root = sysroot.ok_or_else(|| format!("{exe} is dynamically linked (needs {interp}): pass -L <sysroot> or link it statically"))?;
+        let ipath = in_sysroot(Some(root), PathBuf::from(interp));
+        let idata = std::fs::read(&ipath).map_err(|e| format!("cannot read the dynamic loader {}: {e}", ipath.display()))?;
+        let span = align_up(elf_span(&idata)?);
+        let ibase = stack_low.checked_sub(span).ok_or("dynamic loader does not fit")? & !0xffff;
+        let i = map_elf(bus, arch, &idata, ibase)?;
+        entry = i.entry;
+        at_base = ibase;
+        stack_low = ibase;
+    }
     if top + STACK_SIZE + STACK_GAP + (16 << 20) > ram_end {
         return Err("program does not fit in RAM (use -m)".into());
     }
@@ -1614,9 +1681,9 @@ pub fn load(bus: &mut Bus, arch: Arch, exe: &str, d: &[u8], argv: &[String], env
         (4, phentsize as u64),
         (5, phnum as u64),
         (6, PAGE),
-        (7, 0),
+        (7, at_base),
         (8, 0),
-        (9, u64_at(24) + bias),
+        (9, main.entry),
         (11, 1000),
         (12, 1000),
         (13, 1000),
@@ -1641,7 +1708,6 @@ pub fn load(bus: &mut Bus, arch: Arch, exe: &str, d: &[u8], argv: &[String], env
         push(*v);
     }
     bus.guest_bytes_mut(sp, w.len()).unwrap().copy_from_slice(&w);
-    let stack_low = ram_end - STACK_SIZE - STACK_GAP;
     let brk = align_up(top);
     // the signal-return trampoline sits between the stack and the mmap area: `mov a7, 139; ecall`
     let tramp = ram_end - STACK_SIZE - PAGE;
@@ -1649,6 +1715,7 @@ pub fn load(bus: &mut Bus, arch: Arch, exe: &str, d: &[u8], argv: &[String], env
     bus.guest_bytes_mut(tramp, 8).unwrap().copy_from_slice(&[code[0].to_le_bytes(), code[1].to_le_bytes()].concat());
     let mut u = LinuxUser::new(arch, exe, brk, stack_low);
     u.tramp = tramp;
+    u.sysroot = sysroot.map(Path::to_path_buf);
     bus.user = Some(Box::new(u));
-    Ok(UserImage { entry: u64_at(24) + bias, sp })
+    Ok(UserImage { entry, sp })
 }

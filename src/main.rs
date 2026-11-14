@@ -23,6 +23,8 @@ OPTIONS:
                                   served by the host (files, stdio, time, mmap/brk, ...). The architecture is
                                   taken from the ELF. Everything after the file name goes to the program.
                                   No threads, fork/exec, signals or dynamic linking. -m sets memory (default 1024)
+    -L <dir>                      with -user: sysroot for dynamically linked programs (the ELF interpreter and
+                                  libraries are taken from <dir> when the guest path exists there)
     -demo <name>                  built-in demo program: hello
     -m <MiB>                      RAM size in MiB (default 128)
     -drive file=<img>[,...]       raw disk image as virtio-mmio block device (writes go to the file)
@@ -61,6 +63,7 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let (mut arch, mut kernel, mut demo_name) = (None, None, None);
     let mut user: Option<(String, Vec<String>)> = None;
+    let mut sysroot: Option<String> = None;
     let mut ram_set = false;
     let mut drives: Vec<String> = Vec::new();
     let (mut rng, mut rng_seed, mut rtc, mut no_reboot) = (false, None, None, false);
@@ -78,6 +81,7 @@ fn main() {
                 let v = val("-M");
                 arch = Some(Arch::parse(&v).unwrap_or_else(|| die(&format!("unknown machine '{v}'"))));
             }
+            "-L" => sysroot = Some(val("-L")),
             "-user" | "--user" => {
                 let prog = val("-user");
                 user = Some((prog, args.by_ref().collect()));
@@ -173,7 +177,7 @@ fn main() {
         let argv: Vec<String> = std::iter::once(prog.clone()).chain(pargs).collect();
         let envp: Vec<String> = std::env::vars().map(|(k, v)| format!("{k}={v}")).collect();
         vm.trace = trace;
-        vm.load_user(&prog, &data, &argv, &envp, if ram_set { ram } else { 1024 }).unwrap_or_else(|e| die(&e));
+        vm.load_user(&prog, &data, &argv, &envp, if ram_set { ram } else { 1024 }, sysroot.as_deref().map(std::path::Path::new)).unwrap_or_else(|e| die(&e));
         let stop = vm.run(icount);
         if regs || matches!(stop, Stop::Fatal(_)) {
             eprintln!("--- {} registers ---\n{}", vm.cpu().name(), vm.cpu().dump());

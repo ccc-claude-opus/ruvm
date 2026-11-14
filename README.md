@@ -24,7 +24,7 @@ tools/linux/fetch-debian.sh && tools/linux/mkroot.sh      # Debian kernels + a s
 ```
 
 **Run a single program** (like `spike pk` / `qemu-user`): `ruvm -user hello.elf [args]` runs a static Linux ELF, serving its
-system calls on the host (`tools/linux/fetch-busybox.sh` gives real glibc binaries to try; [doc/v1.1.md](doc/v1.1.md)).
+system calls on the host (`tools/linux/fetch-busybox.sh` gives real glibc binaries to try; dynamically linked ones run with `-L <sysroot>`; [doc/v1.1.md](doc/v1.1.md)).
 
 Other guests: `-demo hello`, bare ELF programs (`-kernel prog.elf`), MIT xv6-riscv
 (`-kernel tests/guest/prebuilt/xv6/kernel -drive file=tests/guest/prebuilt/xv6/fs.img -snapshot`), OpenSBI (`-bios`).

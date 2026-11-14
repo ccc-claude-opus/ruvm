@@ -18,8 +18,9 @@ for a in riscv64 arm64; do
 done
 
 tools/linux/fetch-busybox.sh
+tools/linux/fetch-sysroot.sh
 
 echo "== Linux tests (boot, ext4 reboot, SMP, network; both architectures)"
-cargo test --release -- --ignored --test-threads=2   # also user-mode busybox
+cargo test --release -- --ignored --test-threads=2   # also user-mode busybox and dynamic linking
 
 echo "ALL OK"

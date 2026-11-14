@@ -578,9 +578,9 @@ impl Machine {
 
     /// User-mode emulation: run a static Linux ELF directly (no kernel, no devices). RAM is
     /// one flat region from 64 KiB (null accesses fault) of `ram_mb` MiB; system calls are served by the host.
-    pub fn load_user(&mut self, exe: &str, data: &[u8], argv: &[String], envp: &[String], ram_mb: usize) -> Result<(), String> {
+    pub fn load_user(&mut self, exe: &str, data: &[u8], argv: &[String], envp: &[String], ram_mb: usize, sysroot: Option<&std::path::Path>) -> Result<(), String> {
         let mut bus = Bus::with_cpus(crate::linux::RAM_BASE, ram_mb << 20, 1);
-        let img = crate::linux::load(&mut bus, self.arch, exe, data, argv, envp)?;
+        let img = crate::linux::load(&mut bus, self.arch, exe, data, argv, envp, sysroot)?;
         self.bus = bus;
         self.ncpus = 1;
         self.start_user(img.entry, img.sp);
