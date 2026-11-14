@@ -55,6 +55,7 @@ static i64 sys6(u64 nr, u64 a, u64 b, u64 c, u64 d, u64 e, u64 f) {
 void start_c(u64 *sp) {
     i64 argc = sp[0];
     char **argv = (char **)(sp + 1);
+    if (argc > 1 && argv[1][0] == 'c' && argv[1][1] == 'h') { out("exec'd image\n"); sys(94, 9, 0, 0, 0); }
     out("hello from user mode\n");
     if (argc > 1 && argv[1][0] == 'n' && argv[1][1] == 'u') *(volatile int *)8 = 1; // null-pointer access must fault
     line("argc", argc);
@@ -111,7 +112,6 @@ void start_c(u64 *sp) {
     char pb[8] = {0};
     line("pipe read", sys(63, pfd[0], (u64)pb, 8, 0));
     out(pb); out("\n");
-    line("pipe empty", sys(63, pfd[0], (u64)pb, 8, 0));
     sys(57, pfd[0], 0, 0, 0);
     line("pipe widowed", sys(64, pfd[1], (u64)"x", 1, 0));
     // dup3 + fcntl(F_DUPFD) onto a pipe, statx, chdir, rename of a missing file
@@ -126,6 +126,35 @@ void start_c(u64 *sp) {
     line("statx size > 0", *(u64 *)(sx + 40) > 0);
     line("chdir", sys(49, (u64)"/", 0, 0, 0));
     line("rename missing", sys6(38, (u64)-100, (u64)"/nonexistent/a", (u64)-100, (u64)"/nonexistent/b", 0, 0));
+
+    // fork: the child writes into a pipe and exits; the parent reads it and collects the status
+    int q[2];
+    sys(59, (u64)q, 0, 0, 0);
+    i64 pid = sys6(220, 17 /* SIGCHLD */, 0, 0, 0, 0, 0);
+    if (pid == 0) {
+        sys(64, q[1], (u64)"from child", 10, 0);
+        sys(94, 7, 0, 0, 0);
+    }
+    sys(57, q[1], 0, 0, 0);
+    char cb[16] = {0};
+    line("fork pipe read", sys(63, q[0], (u64)cb, 16, 0));
+    out(cb); out("\n");
+    int st = 0;
+    line("wait4 pid ok", sys6(260, pid, (u64)&st, 0, 0, 0, 0) == pid);
+    line("child status", st);
+    line("wait4 no children", sys6(260, (u64)-1, (u64)&st, 0, 0, 0, 0));
+    // fork + execve of ourselves: the new image runs with the inherited descriptors
+    pid = sys6(220, 17, 0, 0, 0, 0, 0);
+    if (pid == 0) {
+        char *av[] = {"x", "child2", 0};
+        char *ev[] = {0};
+        sys6(221, (u64)"/proc/self/exe", (u64)av, (u64)ev, 0, 0, 0);
+        sys(94, 99, 0, 0, 0);
+    }
+    sys6(260, pid, (u64)&st, 0, 0, 0, 0);
+    line("exec status", st);
+    char *av2[] = {"x", 0};
+    line("exec missing", sys6(221, (u64)"/nonexistent/prog", (u64)av2, (u64)av2 + 8, 0, 0, 0));
 
     line("unknown syscall", sys(9999, 0, 0, 0, 0));
     sys(94, 3, 0, 0, 0);

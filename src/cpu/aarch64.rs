@@ -1010,6 +1010,11 @@ impl Aarch64 {
             match r {
                 Host::Exit(c) => return Err(Stop::Halt(c).into()),
                 Host::Ret(v) => self.x[0] = v,
+                Host::RetSp(v, sp) => {
+                    self.x[0] = v;
+                    self.sp = sp;
+                }
+                Host::Exec => return Err(Stop::Exec.into()),
             }
         } else if i & 0xffe0_001f == 0xd400_0002 || i & 0xffe0_001f == 0xd400_0003 {
             // ---- HVC / SMC: PSCI

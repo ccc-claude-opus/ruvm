@@ -9,6 +9,10 @@ use std::io::Write;
 
 pub enum Host {
     Ret(u64),
+    /// Return a value and switch the stack pointer (a `clone` child with its own stack).
+    RetSp(u64, u64),
+    /// `execve` succeeded: the machine replaces the process image (see `Stop::Exec`).
+    Exec,
     Exit(i32),
 }
 

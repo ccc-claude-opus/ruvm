@@ -8,13 +8,12 @@
 
 use crate::bus::Bus;
 use crate::machine::Arch;
-use std::collections::VecDeque;
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::os::unix::io::FromRawFd;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const PAGE: u64 = 4096;
@@ -23,15 +22,7 @@ pub const RAM_BASE: u64 = 0x1_0000;
 const STACK_SIZE: u64 = 8 << 20;
 const STACK_GAP: u64 = 8 << 20; // unused space between the stack and the mmap area
 
-/// An in-process pipe: the read end sees what the write end wrote.
-struct Pipe {
-    buf: Mutex<VecDeque<u8>>,
-    writers: AtomicUsize,
-}
-
 enum Fd {
-    PipeR(Arc<Pipe>),
-    PipeW(Arc<Pipe>),
     Stdin,
     Stdout,
     Stderr,
@@ -51,12 +42,34 @@ pub struct LinuxUser {
     start: Instant,
     /// Print every system call to stderr (`RUVM_STRACE=1`).
     strace: bool,
+    /// Descriptors closed by `execve`.
+    cloexec: HashSet<usize>,
+    /// A new process image prepared by `execve`, installed by the machine.
+    pub pending_exec: Option<ExecReq>,
+}
+
+/// Result of a successful `execve`: the new memory image (with the inherited descriptors).
+pub struct ExecReq {
+    pub bus: Bus,
+    pub entry: u64,
+    pub sp: u64,
+}
+
+extern "C" {
+    fn fork() -> i32;
+    fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+    fn pipe(fds: *mut i32) -> i32;
+    fn kill(pid: i32, sig: i32) -> i32;
 }
 
 /// What a system call did.
 pub enum Sys {
     Ret(i64),
     Exit(i32),
+    /// `execve` succeeded.
+    Exec,
+    /// Return a value and set the stack pointer (`clone` with a child stack).
+    RetSp(i64, u64),
 }
 
 /// Serve a system call for the CPU: a `host::Host` result (exit, or the return value).
@@ -67,12 +80,16 @@ pub fn syscall(bus: &mut Bus, nr: u64, args: [u64; 6]) -> crate::host::Host {
         match &r {
             Sys::Ret(v) => eprintln!("syscall {nr}({:#x}, {:#x}, {:#x}, {:#x}) = {v}", args[0], args[1], args[2], args[3]),
             Sys::Exit(c) => eprintln!("syscall {nr}({:#x}) exit {c}", args[0]),
+            Sys::Exec => eprintln!("syscall {nr} execve"),
+            Sys::RetSp(v, sp) => eprintln!("syscall {nr} = {v} (sp {sp:#x})"),
         }
     }
     bus.user = Some(u);
     match r {
         Sys::Ret(v) => crate::host::Host::Ret(v as u64),
         Sys::Exit(c) => crate::host::Host::Exit(c),
+        Sys::Exec => crate::host::Host::Exec,
+        Sys::RetSp(v, sp) => crate::host::Host::RetSp(v as u64, sp),
     }
 }
 
@@ -98,6 +115,7 @@ fn errno(e: &std::io::Error) -> i64 {
 }
 
 const EBADF: i64 = -9;
+const ENOENT: i64 = -2;
 const ENOMEM: i64 = -12;
 const EFAULT: i64 = -14;
 const EINVAL: i64 = -22;
@@ -118,6 +136,8 @@ impl LinuxUser {
             rng: seed | 1,
             start: Instant::now(),
             strace: std::env::var_os("RUVM_STRACE").is_some(),
+            cloexec: HashSet::new(),
+            pending_exec: None,
         }
     }
 
@@ -135,11 +155,6 @@ impl LinuxUser {
             Some(Some(Fd::Stderr)) => Fd::Stderr,
             Some(Some(Fd::File(f))) => Fd::File(f.try_clone().map_err(|e| errno(&e))?),
             Some(Some(Fd::Dir(p, e, n))) => Fd::Dir(p.clone(), e.clone(), *n),
-            Some(Some(Fd::PipeR(p))) => Fd::PipeR(p.clone()),
-            Some(Some(Fd::PipeW(p))) => {
-                p.writers.fetch_add(1, Ordering::SeqCst);
-                Fd::PipeW(p.clone())
-            }
             _ => return Err(EBADF),
         })
     }
@@ -147,12 +162,8 @@ impl LinuxUser {
     fn close_fd(&mut self, fd: usize) -> i64 {
         match self.fds.get_mut(fd) {
             Some(slot @ Some(_)) => {
-                if let Some(Fd::PipeW(p)) = slot {
-                    p.writers.fetch_sub(1, Ordering::SeqCst);
-                }
-                if fd > 2 {
-                    *slot = None;
-                }
+                *slot = None;
+                self.cloexec.remove(&fd);
                 0
             }
             _ => EBADF,
@@ -167,7 +178,11 @@ impl LinuxUser {
         while self.fds.len() < min {
             self.fds.push(None);
         }
-        match self.fds.iter().skip(min).position(|f| f.is_none()).map(|i| i + min) {
+        let at = self.fds.iter().skip(min).position(|f| f.is_none()).map(|i| i + min);
+        if let Some(i) = at {
+            self.cloexec.remove(&i);
+        }
+        match at {
             Some(i) => {
                 self.fds[i] = Some(fd);
                 i as i64
@@ -305,13 +320,6 @@ impl LinuxUser {
                 Some(off) => f.write_at(data, off),
                 None => f.write(data),
             },
-            Some(Some(Fd::PipeW(p))) => {
-                if Arc::strong_count(p) < 2 {
-                    return -32; // EPIPE: no reader left
-                }
-                p.buf.lock().unwrap().extend(data);
-                return data.len() as i64;
-            }
             Some(Some(Fd::Dir(..))) => return -21, // EISDIR
             _ => return EBADF,
         };
@@ -320,22 +328,15 @@ impl LinuxUser {
 
     fn read_fd(&mut self, fd: usize, buf: &mut [u8], at: Option<u64>) -> i64 {
         let r = match self.fds.get_mut(fd) {
-            Some(Some(Fd::Stdin)) => std::io::stdin().read(buf),
+            Some(Some(Fd::Stdin)) => {
+                // raw descriptor 0: no buffering, so a forked child does not see a copy of buffered input
+                let mut f = std::mem::ManuallyDrop::new(unsafe { File::from_raw_fd(0) });
+                f.read(buf)
+            }
             Some(Some(Fd::File(f))) => match at {
                 Some(off) => f.read_at(buf, off),
                 None => f.read(buf),
             },
-            Some(Some(Fd::PipeR(p))) => {
-                let mut q = p.buf.lock().unwrap();
-                let n = buf.len().min(q.len());
-                for b in buf.iter_mut().take(n) {
-                    *b = q.pop_front().unwrap();
-                }
-                if n == 0 && !buf.is_empty() && p.writers.load(Ordering::SeqCst) > 0 {
-                    return -11; // EAGAIN: would block (nothing else could ever write)
-                }
-                return n as i64;
-            }
             Some(Some(Fd::Dir(..))) => return -21,
             _ => return EBADF,
         };
@@ -367,7 +368,11 @@ impl LinuxUser {
                 }
                 Err(e) => return errno(&e),
             }
-            return self.alloc_fd(Fd::Dir(path, ents, 0));
+            let fd = self.alloc_fd(Fd::Dir(path, ents, 0));
+            if flags & 0o2000000 != 0 {
+                self.cloexec.insert(fd as usize);
+            }
+            return fd;
         }
         let mut o = OpenOptions::new();
         match acc {
@@ -388,7 +393,13 @@ impl LinuxUser {
         }
         o.mode(a[3] as u32 & 0o7777);
         match o.open(&path) {
-            Ok(f) => self.alloc_fd(Fd::File(f)),
+            Ok(f) => {
+                let fd = self.alloc_fd(Fd::File(f));
+                if flags & 0o2000000 != 0 {
+                    self.cloexec.insert(fd as usize);
+                }
+                fd
+            }
             Err(e) => errno(&e),
         }
     }
@@ -511,16 +522,25 @@ impl LinuxUser {
                             self.fds.push(None);
                         }
                         self.fds[t] = Some(f);
+                        if a[2] & 0o2000000 != 0 {
+                            self.cloexec.insert(t);
+                        }
                         t as i64
                     }
                 }
                 Err(e) => e,
             },
             59 => {
-                // pipe2(fds, flags)
-                let p = Arc::new(Pipe { buf: Mutex::new(VecDeque::new()), writers: AtomicUsize::new(1) });
-                let r = self.alloc_fd(Fd::PipeR(p.clone()));
-                let w = self.alloc_fd(Fd::PipeW(p));
+                // pipe2(fds, flags): a real host pipe, so it also works between forked processes
+                let mut f = [0i32; 2];
+                if unsafe { pipe(f.as_mut_ptr()) } != 0 {
+                    return Sys::Ret(errno(&std::io::Error::last_os_error()));
+                }
+                let (r, w) = unsafe { (File::from_raw_fd(f[0]), File::from_raw_fd(f[1])) };
+                let (r, w) = (self.alloc_fd(Fd::File(r)), self.alloc_fd(Fd::File(w)));
+                if a[1] & 0o2000000 != 0 {
+                    self.cloexec.extend([r as usize, w as usize]);
+                }
                 match Self::put(bus, a[0], &[(r as i32).to_le_bytes(), (w as i32).to_le_bytes()].concat()) {
                     0 => 0,
                     e => e,
@@ -528,10 +548,25 @@ impl LinuxUser {
             }
             25 => match a[1] {
                 0 | 1030 => match self.dup_fd(a[0] as usize) {
-                    Ok(f) => self.alloc_fd_from(f, a[2] as usize),
+                    Ok(f) => {
+                        let fd = self.alloc_fd_from(f, a[2] as usize);
+                        if a[1] == 1030 {
+                            self.cloexec.insert(fd as usize);
+                        }
+                        fd
+                    }
                     Err(e) => e,
                 },
-                1 | 2 | 3 | 4 => 0,
+                1 => self.cloexec.contains(&(a[0] as usize)) as i64,
+                2 => {
+                    if a[2] & 1 != 0 {
+                        self.cloexec.insert(a[0] as usize);
+                    } else {
+                        self.cloexec.remove(&(a[0] as usize));
+                    }
+                    0
+                }
+                3 | 4 => 0,
                 _ => EINVAL,
             },
             62 => match self.fds.get_mut(a[0] as usize) {
@@ -793,7 +828,7 @@ impl LinuxUser {
                 }
             }
             226 | 233 | 135 | 134 | 132 | 99 | 100 | 167 => 0, // mprotect madvise sigprocmask sigaction sigaltstack robust_list ...
-            96 => 1,  // set_tid_address -> tid
+            96 => std::process::id() as i64, // set_tid_address -> tid
             98 => {
                 // futex: single thread, so a wait could never be woken
                 match a[1] & 0x7f {
@@ -844,10 +879,9 @@ impl LinuxUser {
                 Self::put(bus, a[0], &b)
             }
             166 => 0o22,
-            172 => 1000,
-            173 => 1,
+            172 | 178 => std::process::id() as i64,
+            173 => std::os::unix::process::parent_id() as i64,
             174 | 175 | 176 | 177 => 1000,
-            178 => 1000,
             261 => {
                 // prlimit64(pid, resource, new, old)
                 if a[3] != 0 {
@@ -872,18 +906,130 @@ impl LinuxUser {
                 }
             }
             129 | 130 | 131 => {
-                // kill / tkill / tgkill: a fatal signal ends the program the way a shell reports it
-                let sig = if nr == 131 { a[2] } else { a[1] };
+                // kill / tkill / tgkill: a signal to ourselves ends the program the way a shell reports it;
+                // a signal to a child process is passed on to the host
+                let (pid, sig) = if nr == 131 { (a[1] as i32, a[2] as i32) } else { (a[0] as i32, a[1] as i32) };
+                let host_sig = match sig {
+                    10 => 30,
+                    12 => 31,
+                    17 => 20,
+                    18 => 19,
+                    19 => 17,
+                    s => s,
+                };
                 if sig == 0 {
                     0
+                } else if pid == std::process::id() as i32 || nr != 129 {
+                    return Sys::Exit(128 + sig);
+                } else if unsafe { kill(pid, host_sig) } == 0 {
+                    0
                 } else {
-                    return Sys::Exit(128 + sig as i32);
+                    errno(&std::io::Error::last_os_error())
                 }
             }
-            435 | 220 | 221 => ENOSYS, // clone3 / clone / execve: no processes
+            220 => {
+                // clone: fork semantics via a host fork (threads are not supported)
+                let flags = a[0];
+                if flags & 0x10000 != 0 {
+                    ENOSYS
+                } else {
+                    let pid = unsafe { fork() };
+                    if pid < 0 {
+                        errno(&std::io::Error::last_os_error())
+                    } else if pid == 0 {
+                        let me = std::process::id();
+                        if flags & 0x0100_0000 != 0 && a[4] != 0 {
+                            Self::put(bus, a[4], &me.to_le_bytes()); // CLONE_CHILD_SETTID
+                        }
+                        return if a[1] != 0 { Sys::RetSp(0, a[1]) } else { Sys::Ret(0) };
+                    } else {
+                        if flags & 0x10_0000 != 0 && a[2] != 0 {
+                            Self::put(bus, a[2], &(pid as u32).to_le_bytes()); // CLONE_PARENT_SETTID
+                        }
+                        pid as i64
+                    }
+                }
+            }
+            260 => {
+                // wait4(pid, status, options, rusage)
+                let mut st = 0i32;
+                let pid = if (a[0] as i32) > 0 { a[0] as i32 } else { -1 };
+                let r = unsafe { waitpid(pid, &mut st, a[2] as i32 & 1) };
+                if r < 0 {
+                    errno(&std::io::Error::last_os_error())
+                } else {
+                    if r > 0 && a[1] != 0 {
+                        Self::put(bus, a[1], &st.to_le_bytes());
+                    }
+                    r as i64
+                }
+            }
+            221 => {
+                let r = self.sys_execve(bus, a);
+                if r == 0 {
+                    return Sys::Exec;
+                }
+                r
+            }
+            435 => ENOSYS, // clone3 (libc falls back to clone)
             _ => ENOSYS,
         };
         Sys::Ret(r)
+    }
+
+    fn strv(bus: &Bus, mut p: u64) -> Option<Vec<String>> {
+        let mut v = Vec::new();
+        if p == 0 {
+            return Some(v);
+        }
+        loop {
+            let ptr = u64::from_le_bytes(bus.guest_bytes(p, 8)?.try_into().unwrap());
+            if ptr == 0 {
+                return Some(v);
+            }
+            v.push(Self::cstr(bus, ptr)?);
+            p += 8;
+            if v.len() > 4096 {
+                return None;
+            }
+        }
+    }
+
+    /// execve(path, argv, envp): build the new image now (so errors can be reported to the caller);
+    /// the machine switches to it after the call returns. Scripts with `#!` are run through their interpreter.
+    fn sys_execve(&mut self, bus: &mut Bus, a: [u64; 6]) -> i64 {
+        let (Some(mut argv), Some(envp)) = (Self::strv(bus, a[1]), Self::strv(bus, a[2])) else { return EFAULT };
+        let mut file = match self.path(bus, -100, a[0]) {
+            Ok(p) => p,
+            Err(e) => return e,
+        };
+        let mut data = match std::fs::read(&file) {
+            Ok(d) => d,
+            Err(e) => return errno(&e),
+        };
+        if data.starts_with(b"#!") {
+            let line = String::from_utf8_lossy(data.split(|&b| b == b'\n').next().unwrap_or(&[])[2..].to_vec().as_slice()).trim().to_string();
+            let mut parts = line.splitn(2, char::is_whitespace);
+            let interp = parts.next().unwrap_or("").to_string();
+            let mut new_argv = vec![interp.clone()];
+            new_argv.extend(parts.next().map(|s| s.trim().to_string()).filter(|s| !s.is_empty()));
+            new_argv.push(file.to_string_lossy().into_owned());
+            new_argv.extend(argv.drain(1.min(argv.len())..));
+            argv = new_argv;
+            file = PathBuf::from(interp);
+            data = match std::fs::read(&file) {
+                Ok(d) => d,
+                Err(e) => return errno(&e),
+            };
+        }
+        let mut nb = Bus::with_cpus(bus.ram_base(), bus.ram_size() as usize, 1);
+        // a file that is not a guest executable (e.g. a host binary found on PATH) does not exist as far as the guest is concerned
+        let Ok(img) = load(&mut nb, self.arch, &file.to_string_lossy(), &data, &argv, &envp) else { return ENOENT };
+        let nu = nb.user.as_mut().unwrap();
+        let keep: HashSet<usize> = (0..self.fds.len()).filter(|i| !self.cloexec.contains(i)).collect();
+        nu.fds = std::mem::take(&mut self.fds).into_iter().enumerate().map(|(i, f)| f.filter(|_| keep.contains(&i))).collect();
+        self.pending_exec = Some(ExecReq { bus: nb, entry: img.entry, sp: img.sp });
+        0
     }
 
     fn sys_fstat(&mut self, bus: &mut Bus, fd: usize, out: u64) -> i64 {

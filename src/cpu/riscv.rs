@@ -1147,12 +1147,18 @@ impl Riscv64 {
                                 match crate::linux::syscall(bus, self.x[17], a) {
                                     Host::Exit(c) => return Err(Ex::Stop(Stop::Halt(c))),
                                     Host::Ret(v) => self.x[10] = v,
+                                    Host::RetSp(v, sp) => {
+                                        self.x[10] = v;
+                                        self.x[2] = sp;
+                                    }
+                                    Host::Exec => return Err(Ex::Stop(Stop::Exec)),
                                 }
                             } else {
                                 let args = [self.x[10], self.x[11], self.x[12]];
                                 match host::syscall(bus, self.x[17], args) {
                                     Host::Exit(c) => return Err(Ex::Stop(Stop::Halt(c))),
-                                    Host::Ret(v) => self.x[10] = v,
+                                    Host::Ret(v) | Host::RetSp(v, _) => self.x[10] = v,
+                                    Host::Exec => {}
                                 }
                             }
                         } else {

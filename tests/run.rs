@@ -544,8 +544,10 @@ fn user_mode_freestanding_program() {
             "hello from user mode\nargc=3\narg: one\narg: two words\npagesz=4096\nrandom=1\nbrk grew=12288\n\
              mmap sum=34359607296\nmunmap=0\nsqrt2 * 1e9=1414213562\nmagic: ELF\nopen missing=-2\n\
              sysname: Linux\nmachine: {machine}\nclock ok=1\n\
-             pipe2=0\npipe read=4\nping\npipe empty=-11\npipe widowed=-32\nF_DUPFD >= 20=1\ndup read=3\n\
-             statx=0\nstatx size > 0=1\nchdir=0\nrename missing=-2\nunknown syscall=-38\n"
+             pipe2=0\npipe read=4\nping\npipe widowed=-32\nF_DUPFD >= 20=1\ndup read=3\n\
+             statx=0\nstatx size > 0=1\nchdir=0\nrename missing=-2\n\
+             fork pipe read=10\nfrom child\nwait4 pid ok=1\nchild status=1792\nwait4 no children=-10\n\
+             exec'd image\nexec status=2304\nexec missing=-2\nunknown syscall=-38\n"
         );
         assert_eq!(out, want, "{elf}");
     }
@@ -579,5 +581,10 @@ fn user_mode_busybox() {
         assert_eq!((c, o.trim()), (0, if arch == "arm64" { "aarch64" } else { "riscv64" }));
         let (c, _) = run_user(&bb, &["false"], b"");
         assert_eq!(c, 1, "{arch}");
+        // a shell: fork, execve of applets, pipelines, redirection, exit status
+        let script = "echo $((6*7)); uname -m | tr a-z A-Z; seq 1 5 | sort -r | tr '\\n' ' '; echo; echo data > /dev/null; sh -c 'exit 3'; echo rc=$?";
+        let (c, o) = run_user(&bb, &["sh", "-c", script], b"");
+        let m = if arch == "arm64" { "AARCH64" } else { "RISCV64" };
+        assert_eq!((c, o.as_str()), (0, format!("42\n{m}\n5 4 3 2 1 \nrc=3\n").as_str()), "{arch}");
     }
 }

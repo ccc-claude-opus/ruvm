@@ -23,6 +23,8 @@ pub enum Stop {
     Limit,
     /// The guest asked for a reboot (the caller decides whether to call `Machine::reset`).
     Reset,
+    /// User mode: `execve` replaced the process image (handled inside `Machine::run`).
+    Exec,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -575,20 +577,33 @@ impl Machine {
         let img = crate::linux::load(&mut bus, self.arch, exe, data, argv, envp)?;
         self.bus = bus;
         self.ncpus = 1;
+        self.start_user(img.entry, img.sp);
+        self.boot = None;
+        Ok(())
+    }
+
+    /// (Re)create the single user-mode CPU at `entry` with stack pointer `sp`.
+    fn start_user(&mut self, entry: u64, sp: u64) {
         self.cpus = vec![match self.arch {
             Arch::Riscv64 => Box::new(Riscv64::new(0)) as Box<dyn Cpu>,
             Arch::Aarch64 => Box::new(Aarch64::new(0)) as Box<dyn Cpu>,
         }];
-        self.start_cpus(img.entry);
+        self.start_cpus(entry);
         match self.arch {
             Arch::Riscv64 => {
                 let c = self.cpus[0].as_any().downcast_mut::<Riscv64>().unwrap();
-                c.set_reg(2, img.sp);
+                c.set_reg(2, sp);
                 c.enable_fp();
             }
-            Arch::Aarch64 => self.cpus[0].as_any().downcast_mut::<Aarch64>().unwrap().set_sp(img.sp),
+            Arch::Aarch64 => self.cpus[0].as_any().downcast_mut::<Aarch64>().unwrap().set_sp(sp),
         }
-        self.boot = None;
+    }
+
+    /// `execve` in user mode: switch to the new memory image prepared by the system call.
+    fn finish_exec(&mut self) -> Result<(), String> {
+        let req = self.bus.user.as_mut().and_then(|u| u.pending_exec.take()).ok_or("exec without a pending image")?;
+        self.bus = req.bus;
+        self.start_user(req.entry, req.sp);
         Ok(())
     }
 
@@ -664,6 +679,12 @@ impl Machine {
                 self.insns += ran;
                 ran_any |= ran > 0;
                 if let Some(s) = stop {
+                    if s == Stop::Exec {
+                        if let Err(e) = self.finish_exec() {
+                            return Stop::Fatal(e);
+                        }
+                        break; // the CPU was replaced: restart the round
+                    }
                     return s;
                 }
                 if self.bus.reset {

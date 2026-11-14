@@ -40,4 +40,4 @@ flowchart LR
 2. **指令集**：RISC-V V、H；ARM EL2、SVE、PAuth。
 3. **裝置**：GICv3、PCI、virtio-gpu / input、9p。
 4. **真正的多執行緒 SMP**。
-5. `-user` 的 `clone`/`fork`/`execve`、訊號、動態連結（載入 ld.so）。
+5. `-user` 的執行緒、訊號、動態連結（載入 ld.so）。
