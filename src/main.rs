@@ -182,8 +182,8 @@ fn main() {
             Stop::Halt(code) => exit(code),
             Stop::Limit => die("instruction limit reached"),
             Stop::Fatal(msg) => {
-                eprintln!("ruvm: fatal: {msg}");
-                exit(1)
+                eprintln!("ruvm: fatal: {msg}\nSegmentation fault");
+                exit(139)
             }
             Stop::Reset => exit(0),
         }

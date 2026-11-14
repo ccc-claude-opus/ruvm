@@ -543,9 +543,20 @@ fn user_mode_freestanding_program() {
         let want = format!(
             "hello from user mode\nargc=3\narg: one\narg: two words\npagesz=4096\nrandom=1\nbrk grew=12288\n\
              mmap sum=34359607296\nmunmap=0\nsqrt2 * 1e9=1414213562\nmagic: ELF\nopen missing=-2\n\
-             sysname: Linux\nmachine: {machine}\nclock ok=1\nunknown syscall=-38\n"
+             sysname: Linux\nmachine: {machine}\nclock ok=1\n\
+             pipe2=0\npipe read=4\nping\npipe empty=-11\npipe widowed=-32\nF_DUPFD >= 20=1\ndup read=3\n\
+             statx=0\nstatx size > 0=1\nchdir=0\nrename missing=-2\nunknown syscall=-38\n"
         );
         assert_eq!(out, want, "{elf}");
+    }
+}
+
+/// A null-pointer access faults (exit status 139) after the program has started.
+#[test]
+fn user_mode_null_pointer_faults() {
+    for elf in ["user_rv.elf", "user_a64.elf"] {
+        let (code, out) = run_user(&format!("tests/guest/prebuilt/{elf}"), &["null"], b"");
+        assert_eq!((code, out.as_str()), (139, "hello from user mode\n"), "{elf}");
     }
 }
 

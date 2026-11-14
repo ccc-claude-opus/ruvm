@@ -2,23 +2,36 @@
 //! or `qemu-user`. The guest runs without an OS; its Linux system calls (`ecall` / `svc #0`)
 //! are served here by the host. RISC-V and AArch64 share the asm-generic syscall table.
 //!
-//! Memory is one flat region starting at address 0: the program at its link addresses,
+//! Memory is one flat region starting at 64 KiB (so null-pointer accesses fault): the program at its link addresses,
 //! `brk` heap above it, `mmap` regions growing down from below the stack, and the stack at the top.
 //! Not supported: threads/`clone`/`fork`/`exec`, signals, dynamic linking, mapping of files shared with the guest.
 
 use crate::bus::Bus;
 use crate::machine::Arch;
+use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 const PAGE: u64 = 4096;
+/// Guest RAM starts here; the first 64 KiB are unmapped so that null-pointer accesses fault.
+pub const RAM_BASE: u64 = 0x1_0000;
 const STACK_SIZE: u64 = 8 << 20;
 const STACK_GAP: u64 = 8 << 20; // unused space between the stack and the mmap area
 
+/// An in-process pipe: the read end sees what the write end wrote.
+struct Pipe {
+    buf: Mutex<VecDeque<u8>>,
+    writers: AtomicUsize,
+}
+
 enum Fd {
+    PipeR(Arc<Pipe>),
+    PipeW(Arc<Pipe>),
     Stdin,
     Stdout,
     Stderr,
@@ -115,8 +128,46 @@ impl LinuxUser {
         self.rng
     }
 
+    fn dup_fd(&self, fd: usize) -> Result<Fd, i64> {
+        Ok(match self.fds.get(fd) {
+            Some(Some(Fd::Stdin)) => Fd::Stdin,
+            Some(Some(Fd::Stdout)) => Fd::Stdout,
+            Some(Some(Fd::Stderr)) => Fd::Stderr,
+            Some(Some(Fd::File(f))) => Fd::File(f.try_clone().map_err(|e| errno(&e))?),
+            Some(Some(Fd::Dir(p, e, n))) => Fd::Dir(p.clone(), e.clone(), *n),
+            Some(Some(Fd::PipeR(p))) => Fd::PipeR(p.clone()),
+            Some(Some(Fd::PipeW(p))) => {
+                p.writers.fetch_add(1, Ordering::SeqCst);
+                Fd::PipeW(p.clone())
+            }
+            _ => return Err(EBADF),
+        })
+    }
+
+    fn close_fd(&mut self, fd: usize) -> i64 {
+        match self.fds.get_mut(fd) {
+            Some(slot @ Some(_)) => {
+                if let Some(Fd::PipeW(p)) = slot {
+                    p.writers.fetch_sub(1, Ordering::SeqCst);
+                }
+                if fd > 2 {
+                    *slot = None;
+                }
+                0
+            }
+            _ => EBADF,
+        }
+    }
+
     fn alloc_fd(&mut self, fd: Fd) -> i64 {
-        match self.fds.iter().position(|f| f.is_none()) {
+        self.alloc_fd_from(fd, 0)
+    }
+
+    fn alloc_fd_from(&mut self, fd: Fd, min: usize) -> i64 {
+        while self.fds.len() < min {
+            self.fds.push(None);
+        }
+        match self.fds.iter().skip(min).position(|f| f.is_none()).map(|i| i + min) {
             Some(i) => {
                 self.fds[i] = Some(fd);
                 i as i64
@@ -172,7 +223,7 @@ impl LinuxUser {
 
     fn path(&self, bus: &Bus, dirfd: i64, p: u64) -> Result<PathBuf, i64> {
         let s = Self::cstr(bus, p).ok_or(EFAULT)?;
-        let path = PathBuf::from(s);
+        let path = if s == "/proc/self/exe" { PathBuf::from(&self.exe) } else { PathBuf::from(s) };
         if path.is_absolute() || dirfd == -100 {
             return Ok(path);
         }
@@ -254,6 +305,13 @@ impl LinuxUser {
                 Some(off) => f.write_at(data, off),
                 None => f.write(data),
             },
+            Some(Some(Fd::PipeW(p))) => {
+                if Arc::strong_count(p) < 2 {
+                    return -32; // EPIPE: no reader left
+                }
+                p.buf.lock().unwrap().extend(data);
+                return data.len() as i64;
+            }
             Some(Some(Fd::Dir(..))) => return -21, // EISDIR
             _ => return EBADF,
         };
@@ -267,6 +325,17 @@ impl LinuxUser {
                 Some(off) => f.read_at(buf, off),
                 None => f.read(buf),
             },
+            Some(Some(Fd::PipeR(p))) => {
+                let mut q = p.buf.lock().unwrap();
+                let n = buf.len().min(q.len());
+                for b in buf.iter_mut().take(n) {
+                    *b = q.pop_front().unwrap();
+                }
+                if n == 0 && !buf.is_empty() && p.writers.load(Ordering::SeqCst) > 0 {
+                    return -11; // EAGAIN: would block (nothing else could ever write)
+                }
+                return n as i64;
+            }
             Some(Some(Fd::Dir(..))) => return -21,
             _ => return EBADF,
         };
@@ -429,50 +498,39 @@ impl LinuxUser {
                 total
             }
             56 => self.sys_openat(bus, a),
-            57 => match self.fds.get_mut(a[0] as usize) {
-                Some(f @ Some(_)) if a[0] > 2 => {
-                    *f = None;
-                    0
-                }
-                Some(Some(_)) => 0,
-                _ => EBADF,
-            },
-            23 | 24 | 1031 => {
-                // dup / dup3: only files can be duplicated
-                match self.fds.get(a[0] as usize) {
-                    Some(Some(Fd::File(f))) => match f.try_clone() {
-                        Ok(c) => {
-                            if nr == 24 {
-                                let t = a[1] as usize;
-                                while self.fds.len() <= t {
-                                    self.fds.push(None);
-                                }
-                                self.fds[t] = Some(Fd::File(c));
-                                t as i64
-                            } else {
-                                self.alloc_fd(Fd::File(c))
-                            }
-                        }
-                        Err(e) => errno(&e),
-                    },
-                    Some(Some(_)) if nr == 24 => {
-                        let (src, t) = (a[0] as usize, a[1] as usize);
-                        let dup = match self.fds[src] {
-                            Some(Fd::Stdin) => Fd::Stdin,
-                            Some(Fd::Stdout) => Fd::Stdout,
-                            _ => Fd::Stderr,
-                        };
+            57 => self.close_fd(a[0] as usize),
+            23 | 24 => match self.dup_fd(a[0] as usize) {
+                Ok(f) if nr == 23 => self.alloc_fd(f),
+                Ok(f) => {
+                    let t = a[1] as usize;
+                    if t == a[0] as usize {
+                        EINVAL
+                    } else {
+                        self.close_fd(t);
                         while self.fds.len() <= t {
                             self.fds.push(None);
                         }
-                        self.fds[t] = Some(dup);
+                        self.fds[t] = Some(f);
                         t as i64
                     }
-                    _ => EBADF,
+                }
+                Err(e) => e,
+            },
+            59 => {
+                // pipe2(fds, flags)
+                let p = Arc::new(Pipe { buf: Mutex::new(VecDeque::new()), writers: AtomicUsize::new(1) });
+                let r = self.alloc_fd(Fd::PipeR(p.clone()));
+                let w = self.alloc_fd(Fd::PipeW(p));
+                match Self::put(bus, a[0], &[(r as i32).to_le_bytes(), (w as i32).to_le_bytes()].concat()) {
+                    0 => 0,
+                    e => e,
                 }
             }
             25 => match a[1] {
-                0 | 1030 => EINVAL,
+                0 | 1030 => match self.dup_fd(a[0] as usize) {
+                    Ok(f) => self.alloc_fd_from(f, a[2] as usize),
+                    Err(e) => e,
+                },
                 1 | 2 | 3 | 4 => 0,
                 _ => EINVAL,
             },
@@ -560,6 +618,130 @@ impl LinuxUser {
                         ready += 1;
                     }
                     bus.guest_bytes_mut(p + 6, 2).unwrap().copy_from_slice(&rev.to_le_bytes());
+                }
+                ready
+            }
+            291 => {
+                // statx(dirfd, path, flags, mask, buf): built from the stat result
+                let (dirfd, flags, out) = (a[0] as i64, a[2], a[4]);
+                let empty = Self::cstr(bus, a[1]).is_some_and(|s| s.is_empty()) && flags & 0x1000 != 0;
+                let r = if empty {
+                    self.sys_fstat(bus, dirfd as usize, out)
+                } else {
+                    match self.path(bus, dirfd, a[1]) {
+                        Ok(p) => {
+                            let md = if flags & 0x100 != 0 { std::fs::symlink_metadata(&p) } else { std::fs::metadata(&p) };
+                            md.map_or_else(|e| errno(&e), |m| self.stat(bus, &m, out))
+                        }
+                        Err(e) => e,
+                    }
+                };
+                if r != 0 {
+                    return Sys::Ret(r);
+                }
+                let st = bus.guest_bytes(out, 128).unwrap().to_vec();
+                let g = |o: usize, n: usize| st[o..o + n].to_vec();
+                let mut x = vec![0u8; 256];
+                x[0..4].copy_from_slice(&0x7ffu32.to_le_bytes()); // STATX_BASIC_STATS
+                x[4..8].copy_from_slice(&g(56, 4));
+                x[16..20].copy_from_slice(&g(20, 4));
+                x[20..24].copy_from_slice(&g(24, 4));
+                x[24..28].copy_from_slice(&g(28, 4));
+                x[28..30].copy_from_slice(&g(16, 2));
+                x[32..40].copy_from_slice(&g(8, 8));
+                x[40..48].copy_from_slice(&g(48, 8));
+                x[48..56].copy_from_slice(&g(64, 8));
+                for (dst, src) in [(64, 72), (96, 104), (112, 88)] {
+                    x[dst..dst + 8].copy_from_slice(&g(src, 8));
+                    x[dst + 8..dst + 12].copy_from_slice(&g(src + 8, 4));
+                }
+                Self::put(bus, out, &x)
+            }
+            38 | 276 => {
+                // renameat(olddir, old, newdir, new) / renameat2(..., flags)
+                match (self.path(bus, a[0] as i64, a[1]), self.path(bus, a[2] as i64, a[3])) {
+                    (Ok(o), Ok(n)) => std::fs::rename(o, n).map_or_else(|e| errno(&e), |_| 0),
+                    (Err(e), _) | (_, Err(e)) => e,
+                }
+            }
+            36 => match (Self::cstr(bus, a[0]), self.path(bus, a[1] as i64, a[2])) {
+                (Some(target), Ok(link)) => std::os::unix::fs::symlink(target, link).map_or_else(|e| errno(&e), |_| 0),
+                (None, _) => EFAULT,
+                (_, Err(e)) => e,
+            },
+            37 => match (self.path(bus, a[0] as i64, a[1]), self.path(bus, a[2] as i64, a[3])) {
+                (Ok(o), Ok(n)) => std::fs::hard_link(o, n).map_or_else(|e| errno(&e), |_| 0),
+                (Err(e), _) | (_, Err(e)) => e,
+            },
+            49 => match self.path(bus, -100, a[0]) {
+                Ok(p) => std::env::set_current_dir(p).map_or_else(|e| errno(&e), |_| 0),
+                Err(e) => e,
+            },
+            50 => match self.fds.get(a[0] as usize) {
+                Some(Some(Fd::Dir(p, _, _))) => std::env::set_current_dir(p).map_or_else(|e| errno(&e), |_| 0),
+                Some(Some(_)) => -20, // ENOTDIR
+                _ => EBADF,
+            },
+            45 => match self.path(bus, -100, a[0]) {
+                Ok(p) => OpenOptions::new().write(true).open(p).and_then(|f| f.set_len(a[1])).map_or_else(|e| errno(&e), |_| 0),
+                Err(e) => e,
+            },
+            46 => match self.fds.get(a[0] as usize) {
+                Some(Some(Fd::File(f))) => f.set_len(a[1]).map_or_else(|e| errno(&e), |_| 0),
+                _ => EBADF,
+            },
+            82 | 83 => match self.fds.get(a[0] as usize) {
+                Some(Some(Fd::File(f))) => f.sync_all().map_or_else(|e| errno(&e), |_| 0),
+                Some(Some(_)) => 0,
+                _ => EBADF,
+            },
+            52 | 53 | 88 | 32 | 47 | 90 | 91 | 55 | 54 | 117 | 118 | 119 | 144 | 146 | 147 | 157 | 154 | 151 | 152 => 0, // chmod/utimes/flock/fallocate/id and session calls: accepted, no effect
+            155 | 158 => 0, // getpgid / getgroups
+            123 => {
+                // sched_getaffinity: one CPU
+                let n = a[1].min(8) as usize;
+                if n == 0 {
+                    EINVAL
+                } else {
+                    match Self::put(bus, a[2], &[1, 0, 0, 0, 0, 0, 0, 0][..n]) {
+                        0 => n as i64,
+                        e => e,
+                    }
+                }
+            }
+            179 => {
+                // sysinfo: 1 GiB total RAM, 1 process
+                let mut b = vec![0u8; 112];
+                b[0..8].copy_from_slice(&self.start.elapsed().as_secs().to_le_bytes());
+                b[32..40].copy_from_slice(&(1u64 << 30).to_le_bytes());
+                b[40..48].copy_from_slice(&(512u64 << 20).to_le_bytes());
+                b[80..82].copy_from_slice(&1u16.to_le_bytes());
+                b[104..108].copy_from_slice(&1u32.to_le_bytes());
+                Self::put(bus, a[0], &b)
+            }
+            43 | 44 => {
+                // statfs / fstatfs: a generic ext4-like answer
+                let mut b = vec![0u8; 120];
+                b[0..8].copy_from_slice(&0xef53u64.to_le_bytes());
+                b[8..16].copy_from_slice(&4096u64.to_le_bytes());
+                for o in [16, 24, 32] {
+                    b[o..o + 8].copy_from_slice(&(1u64 << 20).to_le_bytes());
+                }
+                b[56..64].copy_from_slice(&255u64.to_le_bytes());
+                Self::put(bus, a[1], &b)
+            }
+            72 => {
+                // pselect6: every descriptor counts as ready; the sets are left as they are
+                let n = a[0].min(1024);
+                let mut ready = 0i64;
+                for set in [a[1], a[2]] {
+                    if set != 0 {
+                        for fd in 0..n {
+                            if bus.guest_bytes(set + fd / 8, 1).is_some_and(|b| b[0] >> (fd % 8) & 1 != 0) {
+                                ready += 1;
+                            }
+                        }
+                    }
                 }
                 ready
             }

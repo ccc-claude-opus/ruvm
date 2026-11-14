@@ -56,6 +56,7 @@ void start_c(u64 *sp) {
     i64 argc = sp[0];
     char **argv = (char **)(sp + 1);
     out("hello from user mode\n");
+    if (argc > 1 && argv[1][0] == 'n' && argv[1][1] == 'u') *(volatile int *)8 = 1; // null-pointer access must fault
     line("argc", argc);
     for (i64 i = 1; i < argc; i++) { out("arg: "); out(argv[i]); out("\n"); }
 
@@ -102,6 +103,29 @@ void start_c(u64 *sp) {
     u64 ts[2];
     sys(113, 0, (u64)ts, 0, 0);
     line("clock ok", ts[0] > 1600000000);
+
+    // pipe: bytes written come out of the read end; a closed reader gives EPIPE; an empty pipe would block
+    int pfd[2];
+    line("pipe2", sys(59, (u64)pfd, 0, 0, 0));
+    sys(64, pfd[1], (u64)"ping", 4, 0);
+    char pb[8] = {0};
+    line("pipe read", sys(63, pfd[0], (u64)pb, 8, 0));
+    out(pb); out("\n");
+    line("pipe empty", sys(63, pfd[0], (u64)pb, 8, 0));
+    sys(57, pfd[0], 0, 0, 0);
+    line("pipe widowed", sys(64, pfd[1], (u64)"x", 1, 0));
+    // dup3 + fcntl(F_DUPFD) onto a pipe, statx, chdir, rename of a missing file
+    int p2[2];
+    sys(59, (u64)p2, 0, 0, 0);
+    i64 d = sys(25, p2[1], 0, 20, 0);
+    line("F_DUPFD >= 20", d >= 20);
+    sys(64, d, (u64)"dup", 3, 0);
+    line("dup read", sys(63, p2[0], (u64)pb, 8, 0));
+    unsigned char sx[256];
+    line("statx", sys6(291, (u64)-100, (u64)"/proc/self/exe", 0, 0x7ff, (u64)sx, 0));
+    line("statx size > 0", *(u64 *)(sx + 40) > 0);
+    line("chdir", sys(49, (u64)"/", 0, 0, 0));
+    line("rename missing", sys6(38, (u64)-100, (u64)"/nonexistent/a", (u64)-100, (u64)"/nonexistent/b", 0, 0));
 
     line("unknown syscall", sys(9999, 0, 0, 0, 0));
     sys(94, 3, 0, 0, 0);
