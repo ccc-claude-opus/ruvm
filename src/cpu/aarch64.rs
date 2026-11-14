@@ -323,6 +323,20 @@ impl Aarch64 {
         }
     }
 
+    /// Registers for signal delivery (`-user`).
+    pub fn user_ctx(&self) -> crate::linux::UserCtx {
+        let mut x = [0u64; 32];
+        x[..31].copy_from_slice(&self.x);
+        crate::linux::UserCtx { x, sp: self.sp, pc: self.pc, pstate: self.nzcv() }
+    }
+
+    pub fn set_user_ctx(&mut self, c: &crate::linux::UserCtx) {
+        self.x.copy_from_slice(&c.x[..31]);
+        self.sp = c.sp;
+        self.pc = c.pc;
+        self.set_flags((c.pstate >> 31 & 1 != 0, c.pstate >> 30 & 1 != 0, c.pstate >> 29 & 1 != 0, c.pstate >> 28 & 1 != 0));
+    }
+
     pub fn set_sp(&mut self, sp: u64) {
         self.sp = sp;
     }
@@ -1015,6 +1029,12 @@ impl Aarch64 {
                     self.sp = sp;
                 }
                 Host::Exec => return Err(Stop::Exec.into()),
+                Host::Signal(v) => {
+                    self.x[0] = v;
+                    self.pc = self.pc.wrapping_add(4);
+                    return Err(Stop::Signal.into());
+                }
+                Host::Sigreturn => return Err(Stop::Signal.into()),
             }
         } else if i & 0xffe0_001f == 0xd400_0002 || i & 0xffe0_001f == 0xd400_0003 {
             // ---- HVC / SMC: PSCI

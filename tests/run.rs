@@ -547,7 +547,9 @@ fn user_mode_freestanding_program() {
              pipe2=0\npipe read=4\nping\npipe widowed=-32\nF_DUPFD >= 20=1\ndup read=3\n\
              statx=0\nstatx size > 0=1\nchdir=0\nrename missing=-2\n\
              fork pipe read=10\nfrom child\nwait4 pid ok=1\nchild status=1792\nwait4 no children=-10\n\
-             exec'd image\nexec status=2304\nexec missing=-2\nunknown syscall=-38\n"
+             exec'd image\nexec status=2304\nexec missing=-2\n\
+             sigaction=0\nhandler sig=10\nkill=0\nafter kill got=10\nblocked got=0\nhandler sig=10\nunblocked got=10\n\
+             ignored SIGUSR2 survived\nSIGTERM status=36608\nsegv handler 11\nSIGSEGV status=1280\nunknown syscall=-38\n"
         );
         assert_eq!(out, want, "{elf}");
     }
@@ -586,5 +588,9 @@ fn user_mode_busybox() {
         let (c, o) = run_user(&bb, &["sh", "-c", script], b"");
         let m = if arch == "arm64" { "AARCH64" } else { "RISCV64" };
         assert_eq!((c, o.as_str()), (0, format!("42\n{m}\n5 4 3 2 1 \nrc=3\n").as_str()), "{arch}");
+        // glibc signal handlers: trap + kill to self, a child killed by SIGTERM
+        let trap = "trap 'echo trapped' USR1; kill -USR1 $$; echo after; sh -c 'kill -TERM $$'; echo rc=$?";
+        let (c, o) = run_user(&bb, &["sh", "-c", trap], b"");
+        assert_eq!((c, o.as_str()), (0, "trapped\nafter\nrc=143\n"), "{arch}");
     }
 }

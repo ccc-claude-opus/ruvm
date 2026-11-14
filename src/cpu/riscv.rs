@@ -313,6 +313,17 @@ impl Riscv64 {
         self.csr[MSTATUS] = (self.csr[MSTATUS] & !MS_FS) | (1 << 13);
     }
 
+    /// Registers for signal delivery (`-user`).
+    pub fn user_ctx(&self) -> crate::linux::UserCtx {
+        crate::linux::UserCtx { x: self.x, sp: 0, pc: self.pc, pstate: 0 }
+    }
+
+    pub fn set_user_ctx(&mut self, c: &crate::linux::UserCtx) {
+        self.x = c.x;
+        self.x[0] = 0;
+        self.pc = c.pc;
+    }
+
     pub fn set_reg(&mut self, r: usize, v: u64) {
         self.set(r, v);
     }
@@ -1152,13 +1163,19 @@ impl Riscv64 {
                                         self.x[2] = sp;
                                     }
                                     Host::Exec => return Err(Ex::Stop(Stop::Exec)),
+                                    Host::Signal(v) => {
+                                        self.x[10] = v;
+                                        self.pc = next;
+                                        return Err(Ex::Stop(Stop::Signal));
+                                    }
+                                    Host::Sigreturn => return Err(Ex::Stop(Stop::Signal)),
                                 }
                             } else {
                                 let args = [self.x[10], self.x[11], self.x[12]];
                                 match host::syscall(bus, self.x[17], args) {
                                     Host::Exit(c) => return Err(Ex::Stop(Stop::Halt(c))),
-                                    Host::Ret(v) | Host::RetSp(v, _) => self.x[10] = v,
-                                    Host::Exec => {}
+                                    Host::Ret(v) | Host::RetSp(v, _) | Host::Signal(v) => self.x[10] = v,
+                                    Host::Exec | Host::Sigreturn => {}
                                 }
                             }
                         } else {

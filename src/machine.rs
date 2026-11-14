@@ -25,6 +25,8 @@ pub enum Stop {
     Reset,
     /// User mode: `execve` replaced the process image (handled inside `Machine::run`).
     Exec,
+    /// User mode: a signal handler must run or return (handled inside `Machine::run`).
+    Signal,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -607,6 +609,30 @@ impl Machine {
         Ok(())
     }
 
+    /// User mode: enter a signal handler or return from one (see `linux::LinuxUser::signal_enter`).
+    fn finish_signal(&mut self) -> Result<(), String> {
+        let arch = self.arch;
+        let mut ctx = match arch {
+            Arch::Riscv64 => self.cpus[0].as_any().downcast_mut::<Riscv64>().unwrap().user_ctx(),
+            Arch::Aarch64 => self.cpus[0].as_any().downcast_mut::<Aarch64>().unwrap().user_ctx(),
+        };
+        crate::linux::signal_step(&mut self.bus, arch, &mut ctx)?;
+        match arch {
+            Arch::Riscv64 => self.cpus[0].as_any().downcast_mut::<Riscv64>().unwrap().set_user_ctx(&ctx),
+            Arch::Aarch64 => self.cpus[0].as_any().downcast_mut::<Aarch64>().unwrap().set_user_ctx(&ctx),
+        }
+        Ok(())
+    }
+
+    /// User mode: a fault (the emulator's `Stop::Fatal`) becomes SIGSEGV / SIGILL if the program has a handler for it.
+    fn fault_signal(&mut self, msg: &str) -> bool {
+        let Some(u) = self.bus.user.as_mut() else { return false };
+        if !u.arm_fault_signal(msg) {
+            return false;
+        }
+        self.finish_signal().is_ok()
+    }
+
     /// Load a raw binary at `addr` and start executing there.
     pub fn load_raw(&mut self, addr: u64, data: &[u8]) -> Result<(), String> {
         self.bus.load(addr, data)?;
@@ -679,13 +705,22 @@ impl Machine {
                 self.insns += ran;
                 ran_any |= ran > 0;
                 if let Some(s) = stop {
-                    if s == Stop::Exec {
-                        if let Err(e) = self.finish_exec() {
-                            return Stop::Fatal(e);
+                    match &s {
+                        Stop::Exec => {
+                            if let Err(e) = self.finish_exec() {
+                                return Stop::Fatal(e);
+                            }
+                            break; // the CPU was replaced: restart the round
                         }
-                        break; // the CPU was replaced: restart the round
+                        Stop::Signal => {
+                            if let Err(e) = self.finish_signal() {
+                                return Stop::Fatal(e);
+                            }
+                            break;
+                        }
+                        Stop::Fatal(msg) if self.fault_signal(msg) => break, // a SIGSEGV/SIGILL handler took over
+                        _ => return s,
                     }
-                    return s;
                 }
                 if self.bus.reset {
                     return Stop::Reset;

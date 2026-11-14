@@ -13,6 +13,10 @@ pub enum Host {
     RetSp(u64, u64),
     /// `execve` succeeded: the machine replaces the process image (see `Stop::Exec`).
     Exec,
+    /// Return a value, then run a signal handler (the machine builds the signal frame).
+    Signal(u64),
+    /// `rt_sigreturn`: the machine restores the interrupted context.
+    Sigreturn,
     Exit(i32),
 }
 

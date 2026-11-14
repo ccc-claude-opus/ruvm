@@ -44,7 +44,7 @@ Options: `-m MB`, `-smp N`, `-drive file=…[,…]`, `-snapshot`, `-rng`, `-rng-
 Devices (both boards): NS16550 / PL011 console, virtio-mmio block, rng and net (user-mode network stack: DHCP, DNS,
 ICMP, UDP, TCP, port forwarding), RTC, power-off and reboot. A device tree is generated for each board.
 
-**Not implemented**: RISC-V V and H, ARM EL2/EL3, SVE, pointer authentication, GICv3, PCI, graphics, JIT; in `-user` mode threads and signals.
+**Not implemented**: RISC-V V and H, ARM EL2/EL3, SVE, pointer authentication, GICv3, PCI, graphics, JIT; in `-user` mode threads and asynchronous signals (alarm, SIGCHLD).
 Speed is that of a plain interpreter, about 120 MIPS (see [doc/v0.8.md](doc/v0.8.md)); a Debian boot takes about a minute.
 
 ## Testing

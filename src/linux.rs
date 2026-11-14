@@ -46,7 +46,42 @@ pub struct LinuxUser {
     cloexec: HashSet<usize>,
     /// A new process image prepared by `execve`, installed by the machine.
     pub pending_exec: Option<ExecReq>,
+    /// Signal dispositions (index = signal number), blocked and pending sets (bit n-1 = signal n).
+    actions: Vec<SigAction>,
+    blocked: u64,
+    pending: u64,
+    /// What the machine must do after `Stop::Signal`.
+    pub signal_op: Option<SignalOp>,
+    /// Address of the `rt_sigreturn` trampoline (`mov a7, 139; ecall`).
+    tramp: u64,
 }
+
+#[derive(Clone, Copy, Default)]
+struct SigAction {
+    handler: u64, // 0 = default, 1 = ignore
+    flags: u64,
+    mask: u64,
+}
+
+pub enum SignalOp {
+    /// Run the handler of `sig` (siginfo `code`, fault/sender `addr`).
+    Deliver { sig: i32, code: i32, addr: u64 },
+    /// `rt_sigreturn`
+    Return,
+}
+
+/// User-mode registers as seen by signal delivery: RISC-V `x[0..32]` (sp = x2), AArch64 `x[0..31]` + `sp`.
+#[derive(Clone)]
+pub struct UserCtx {
+    pub x: [u64; 32],
+    pub sp: u64,
+    pub pc: u64,
+    pub pstate: u64,
+}
+
+const SA_NODEFER: u64 = 0x4000_0000;
+const SA_RESETHAND: u64 = 0x8000_0000;
+const SI_TKILL: i32 = -6;
 
 /// Result of a successful `execve`: the new memory image (with the inherited descriptors).
 pub struct ExecReq {
@@ -70,18 +105,34 @@ pub enum Sys {
     Exec,
     /// Return a value and set the stack pointer (`clone` with a child stack).
     RetSp(i64, u64),
+    /// `rt_sigreturn`
+    Sigreturn,
+    /// Return a value, then run a signal handler.
+    Signal(i64),
 }
 
 /// Serve a system call for the CPU: a `host::Host` result (exit, or the return value).
 pub fn syscall(bus: &mut Bus, nr: u64, args: [u64; 6]) -> crate::host::Host {
     let mut u = bus.user.take().expect("user-mode state");
     let r = u.syscall(bus, nr, args);
+    let r = match r {
+        Sys::Ret(v) => match u.take_deliverable() {
+            Some((sig, addr)) => {
+                u.signal_op = Some(SignalOp::Deliver { sig, code: SI_TKILL, addr });
+                Sys::Signal(v)
+            }
+            None => Sys::Ret(v),
+        },
+        r => r,
+    };
     if u.strace {
         match &r {
             Sys::Ret(v) => eprintln!("syscall {nr}({:#x}, {:#x}, {:#x}, {:#x}) = {v}", args[0], args[1], args[2], args[3]),
             Sys::Exit(c) => eprintln!("syscall {nr}({:#x}) exit {c}", args[0]),
             Sys::Exec => eprintln!("syscall {nr} execve"),
             Sys::RetSp(v, sp) => eprintln!("syscall {nr} = {v} (sp {sp:#x})"),
+            Sys::Sigreturn => eprintln!("syscall {nr} rt_sigreturn"),
+            Sys::Signal(v) => eprintln!("syscall {nr} = {v}, then a signal handler"),
         }
     }
     bus.user = Some(u);
@@ -90,6 +141,8 @@ pub fn syscall(bus: &mut Bus, nr: u64, args: [u64; 6]) -> crate::host::Host {
         Sys::Exit(c) => crate::host::Host::Exit(c),
         Sys::Exec => crate::host::Host::Exec,
         Sys::RetSp(v, sp) => crate::host::Host::RetSp(v as u64, sp),
+        Sys::Sigreturn => crate::host::Host::Sigreturn,
+        Sys::Signal(v) => crate::host::Host::Signal(v as u64),
     }
 }
 
@@ -138,6 +191,11 @@ impl LinuxUser {
             strace: std::env::var_os("RUVM_STRACE").is_some(),
             cloexec: HashSet::new(),
             pending_exec: None,
+            actions: vec![SigAction::default(); 65],
+            blocked: 0,
+            pending: 0,
+            signal_op: None,
+            tramp: 0,
         }
     }
 
@@ -827,7 +885,7 @@ impl LinuxUser {
                     }
                 }
             }
-            226 | 233 | 135 | 134 | 132 | 99 | 100 | 167 => 0, // mprotect madvise sigprocmask sigaction sigaltstack robust_list ...
+            226 | 233 | 132 | 99 | 100 | 167 => 0, // mprotect madvise sigprocmask sigaction sigaltstack robust_list ...
             96 => std::process::id() as i64, // set_tid_address -> tid
             98 => {
                 // futex: single thread, so a wait could never be woken
@@ -906,7 +964,7 @@ impl LinuxUser {
                 }
             }
             129 | 130 | 131 => {
-                // kill / tkill / tgkill: a signal to ourselves ends the program the way a shell reports it;
+                // kill / tkill / tgkill: a signal to ourselves goes through the signal machinery;
                 // a signal to a child process is passed on to the host
                 let (pid, sig) = if nr == 131 { (a[1] as i32, a[2] as i32) } else { (a[0] as i32, a[1] as i32) };
                 let host_sig = match sig {
@@ -919,14 +977,63 @@ impl LinuxUser {
                 };
                 if sig == 0 {
                     0
-                } else if pid == std::process::id() as i32 || nr != 129 {
-                    return Sys::Exit(128 + sig);
+                } else if !(1..=64).contains(&sig) {
+                    EINVAL
+                } else if pid == std::process::id() as i32 || pid == 0 || nr != 129 {
+                    if self.raise(sig) {
+                        return Sys::Exit(128 + sig);
+                    }
+                    0
                 } else if unsafe { kill(pid, host_sig) } == 0 {
                     0
                 } else {
                     errno(&std::io::Error::last_os_error())
                 }
             }
+            134 => {
+                // rt_sigaction(sig, act, oact, size): struct { handler, flags, mask }
+                let sig = a[0] as usize;
+                if !(1..=64).contains(&sig) || (a[1] != 0 && (sig == 9 || sig == 19)) {
+                    EINVAL
+                } else {
+                    let old = self.actions[sig];
+                    if a[2] != 0 {
+                        let mut b = old.handler.to_le_bytes().to_vec();
+                        b.extend_from_slice(&old.flags.to_le_bytes());
+                        b.extend_from_slice(&old.mask.to_le_bytes());
+                        if Self::put(bus, a[2], &b) != 0 {
+                            return Sys::Ret(EFAULT);
+                        }
+                    }
+                    if a[1] != 0 {
+                        let Some(b) = bus.guest_bytes(a[1], 24) else { return Sys::Ret(EFAULT) };
+                        let g = |o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+                        self.actions[sig] = SigAction { handler: g(0), flags: g(8), mask: g(16) };
+                    }
+                    0
+                }
+            }
+            135 => {
+                // rt_sigprocmask(how, set, oldset, size)
+                if a[2] != 0 && Self::put(bus, a[2], &self.blocked.to_le_bytes()) != 0 {
+                    return Sys::Ret(EFAULT);
+                }
+                if a[1] != 0 {
+                    let Some(b) = bus.guest_bytes(a[1], 8) else { return Sys::Ret(EFAULT) };
+                    let set = u64::from_le_bytes(b.try_into().unwrap());
+                    match a[0] {
+                        0 => self.blocked |= set,
+                        1 => self.blocked &= !set,
+                        2 => self.blocked = set,
+                        _ => return Sys::Ret(EINVAL),
+                    }
+                    self.blocked &= !((1 << 8) | (1 << 18)); // SIGKILL and SIGSTOP cannot be blocked
+                }
+                0
+            }
+            136 => Self::put(bus, a[0], &(self.pending & self.blocked).to_le_bytes()),
+            133 => -4, // rt_sigsuspend: nothing could wake us, report EINTR
+            139 => return Sys::Sigreturn,
             220 => {
                 // clone: fork semantics via a host fork (threads are not supported)
                 let flags = a[0];
@@ -1027,9 +1134,145 @@ impl LinuxUser {
         let Ok(img) = load(&mut nb, self.arch, &file.to_string_lossy(), &data, &argv, &envp) else { return ENOENT };
         let nu = nb.user.as_mut().unwrap();
         let keep: HashSet<usize> = (0..self.fds.len()).filter(|i| !self.cloexec.contains(i)).collect();
+        nu.blocked = self.blocked;
+        for (i, act) in self.actions.iter().enumerate() {
+            if act.handler == 1 {
+                nu.actions[i].handler = 1;
+            }
+        }
         nu.fds = std::mem::take(&mut self.fds).into_iter().enumerate().map(|(i, f)| f.filter(|_| keep.contains(&i))).collect();
         self.pending_exec = Some(ExecReq { bus: nb, entry: img.entry, sp: img.sp });
         0
+    }
+
+    /// A signal to ourselves. Returns true if the default action ends the program.
+    fn raise(&mut self, sig: i32) -> bool {
+        let act = self.actions[sig as usize];
+        let bit = 1u64 << (sig - 1);
+        if sig == 9 {
+            return true;
+        }
+        match act.handler {
+            1 => false,
+            0 => !matches!(sig, 17 | 18 | 19 | 20 | 21 | 22 | 23 | 28), // CHLD CONT STOP TSTP TTIN TTOU URG WINCH
+            _ => {
+                self.pending |= bit;
+                false
+            }
+        }
+    }
+
+    /// The lowest pending, unblocked signal (removed from the pending set) and the sender (ourselves).
+    fn take_deliverable(&mut self) -> Option<(i32, u64)> {
+        let ready = self.pending & !self.blocked;
+        if ready == 0 {
+            return None;
+        }
+        let sig = ready.trailing_zeros() as i32 + 1;
+        self.pending &= !(1 << (sig - 1));
+        Some((sig, std::process::id() as u64))
+    }
+
+    /// A fault the guest has a handler for: queue SIGSEGV / SIGILL delivery. False if it must stay fatal.
+    pub fn arm_fault_signal(&mut self, msg: &str) -> bool {
+        let sig = if msg.contains("cause=2 ") || msg.contains("undefined") || msg.contains("illegal") { 4 } else { 11 };
+        let act = self.actions[sig as usize];
+        if act.handler <= 1 || self.blocked & (1 << (sig - 1)) != 0 {
+            return false;
+        }
+        let addr = msg.find("tval=0x").and_then(|i| u64::from_str_radix(msg[i + 7..].split(|c: char| !c.is_ascii_hexdigit()).next()?, 16).ok()).unwrap_or(0);
+        self.signal_op = Some(SignalOp::Deliver { sig, code: 1, addr });
+        true
+    }
+
+    fn signal_dispatch(&mut self, bus: &mut Bus, arch: Arch, ctx: &mut UserCtx) -> Result<(), String> {
+        match self.signal_op.take() {
+            Some(SignalOp::Deliver { sig, code, addr }) => self.signal_enter(bus, arch, ctx, sig, code, addr),
+            Some(SignalOp::Return) | None => {
+                self.signal_leave(bus, arch, ctx)?;
+                match self.take_deliverable() {
+                    Some((sig, pid)) => self.signal_enter(bus, arch, ctx, sig, SI_TKILL, pid),
+                    None => Ok(()),
+                }
+            }
+        }
+    }
+
+    /// Frame layout (Linux `rt_sigframe`): siginfo at +0, ucontext at +128 (sigmask at +40 inside it),
+    /// machine context at +304 (RISC-V: pc, x1..x31; AArch64: fault address, x0..x30, sp, pc, pstate).
+    fn frame_size(arch: Arch) -> u64 {
+        if arch == Arch::Riscv64 { 1088 } else { 4688 }
+    }
+
+    fn signal_enter(&mut self, bus: &mut Bus, arch: Arch, ctx: &mut UserCtx, sig: i32, code: i32, addr: u64) -> Result<(), String> {
+        let act = self.actions[sig as usize];
+        let rv = arch == Arch::Riscv64;
+        let sp = if rv { ctx.x[2] } else { ctx.sp };
+        let f = sp.wrapping_sub(Self::frame_size(arch)) & !15;
+        let size = Self::frame_size(arch) as usize;
+        let m = bus.guest_bytes_mut(f, size).ok_or_else(|| format!("signal frame at {f:#x} is outside memory"))?;
+        m.fill(0);
+        let w64 = |m: &mut [u8], o: usize, v: u64| m[o..o + 8].copy_from_slice(&v.to_le_bytes());
+        m[0..4].copy_from_slice(&sig.to_le_bytes());
+        m[8..12].copy_from_slice(&code.to_le_bytes());
+        w64(m, 16, addr);
+        w64(m, 128 + 40, self.blocked);
+        if rv {
+            w64(m, 304, ctx.pc);
+            for i in 1..32 {
+                w64(m, 304 + 8 * i, ctx.x[i]);
+            }
+        } else {
+            w64(m, 304, addr);
+            for i in 0..31 {
+                w64(m, 312 + 8 * i, ctx.x[i]);
+            }
+            w64(m, 560, ctx.sp);
+            w64(m, 568, ctx.pc);
+            w64(m, 576, ctx.pstate);
+        }
+        self.blocked |= act.mask | if act.flags & SA_NODEFER != 0 { 0 } else { 1 << (sig - 1) };
+        self.blocked &= !((1 << 8) | (1 << 18));
+        if act.flags & SA_RESETHAND != 0 {
+            self.actions[sig as usize].handler = 0;
+        }
+        if rv {
+            ctx.x[10] = sig as u64;
+            ctx.x[11] = f;
+            ctx.x[12] = f + 128;
+            ctx.x[1] = self.tramp;
+            ctx.x[2] = f;
+        } else {
+            ctx.x[0] = sig as u64;
+            ctx.x[1] = f;
+            ctx.x[2] = f + 128;
+            ctx.x[30] = self.tramp;
+            ctx.sp = f;
+        }
+        ctx.pc = act.handler;
+        Ok(())
+    }
+
+    fn signal_leave(&mut self, bus: &mut Bus, arch: Arch, ctx: &mut UserCtx) -> Result<(), String> {
+        let rv = arch == Arch::Riscv64;
+        let f = if rv { ctx.x[2] } else { ctx.sp };
+        let m = bus.guest_bytes(f, Self::frame_size(arch) as usize).ok_or("rt_sigreturn: bad signal frame")?;
+        let r64 = |o: usize| u64::from_le_bytes(m[o..o + 8].try_into().unwrap());
+        self.blocked = r64(128 + 40) & !((1 << 8) | (1 << 18));
+        if rv {
+            ctx.pc = r64(304);
+            for i in 1..32 {
+                ctx.x[i] = r64(304 + 8 * i);
+            }
+        } else {
+            for i in 0..31 {
+                ctx.x[i] = r64(312 + 8 * i);
+            }
+            ctx.sp = r64(560);
+            ctx.pc = r64(568);
+            ctx.pstate = r64(576);
+        }
+        Ok(())
     }
 
     fn sys_fstat(&mut self, bus: &mut Bus, fd: usize, out: u64) -> i64 {
@@ -1046,6 +1289,14 @@ impl LinuxUser {
             _ => EBADF,
         }
     }
+}
+
+/// Enter a signal handler or return from one, as requested by the last system call.
+pub fn signal_step(bus: &mut Bus, arch: Arch, ctx: &mut UserCtx) -> Result<(), String> {
+    let mut u = bus.user.take().ok_or("no user-mode state")?;
+    let r = u.signal_dispatch(bus, arch, ctx);
+    bus.user = Some(u);
+    r
 }
 
 /// Program image placed in guest memory plus the initial stack.
@@ -1146,6 +1397,12 @@ pub fn load(bus: &mut Bus, arch: Arch, exe: &str, d: &[u8], argv: &[String], env
     bus.guest_bytes_mut(sp, w.len()).unwrap().copy_from_slice(&w);
     let stack_low = ram_end - STACK_SIZE - STACK_GAP;
     let brk = align_up(top);
-    bus.user = Some(Box::new(LinuxUser::new(arch, exe, brk, stack_low)));
+    // the signal-return trampoline sits between the stack and the mmap area: `mov a7, 139; ecall`
+    let tramp = ram_end - STACK_SIZE - PAGE;
+    let code: [u32; 2] = if arch == Arch::Riscv64 { [0x08b0_0893, 0x0000_0073] } else { [0xd280_1168, 0xd400_0001] };
+    bus.guest_bytes_mut(tramp, 8).unwrap().copy_from_slice(&[code[0].to_le_bytes(), code[1].to_le_bytes()].concat());
+    let mut u = LinuxUser::new(arch, exe, brk, stack_low);
+    u.tramp = tramp;
+    bus.user = Some(Box::new(u));
     Ok(UserImage { entry: u64_at(24) + bias, sp })
 }

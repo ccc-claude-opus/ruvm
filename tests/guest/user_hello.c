@@ -52,6 +52,10 @@ static i64 sys6(u64 nr, u64 a, u64 b, u64 c, u64 d, u64 e, u64 f) {
 }
 #endif
 
+static volatile int got;
+static void on_sig(int sig) { got = sig; out("handler sig="); num(sig); out("\n"); }
+static void on_segv(int sig) { out("segv handler "); num(sig); out("\n"); sys(94, 5, 0, 0, 0); }
+
 void start_c(u64 *sp) {
     i64 argc = sp[0];
     char **argv = (char **)(sp + 1);
@@ -155,6 +159,37 @@ void start_c(u64 *sp) {
     line("exec status", st);
     char *av2[] = {"x", 0};
     line("exec missing", sys6(221, (u64)"/nonexistent/prog", (u64)av2, (u64)av2 + 8, 0, 0, 0));
+
+    // signals: handler on kill(self), blocking and unblocking, ignoring, default action, SIGSEGV handler
+    u64 act[3] = {(u64)on_sig, 0, 0};
+    line("sigaction", sys(134, 10, (u64)act, 0, 8));
+    i64 me = sys(172, 0, 0, 0, 0);
+    line("kill", sys(129, me, 10, 0, 0));
+    line("after kill got", got);
+    got = 0;
+    u64 set = 1UL << 9; // SIGUSR1
+    sys(135, 0, (u64)&set, 0, 8);
+    sys(129, me, 10, 0, 0);
+    line("blocked got", got);
+    sys(135, 1, (u64)&set, 0, 8);
+    line("unblocked got", got);
+    u64 ign[3] = {1, 0, 0};
+    sys(134, 12, (u64)ign, 0, 8);
+    sys(129, me, 12, 0, 0);
+    out("ignored SIGUSR2 survived\n");
+    pid = sys6(220, 17, 0, 0, 0, 0, 0);
+    if (pid == 0) { sys(129, sys(172, 0, 0, 0, 0), 15, 0, 0); sys(94, 99, 0, 0, 0); }
+    sys6(260, pid, (u64)&st, 0, 0, 0, 0);
+    line("SIGTERM status", st);
+    pid = sys6(220, 17, 0, 0, 0, 0, 0);
+    if (pid == 0) {
+        u64 sv[3] = {(u64)on_segv, 0, 0};
+        sys(134, 11, (u64)sv, 0, 8);
+        *(volatile int *)16 = 1;
+        sys(94, 99, 0, 0, 0);
+    }
+    sys6(260, pid, (u64)&st, 0, 0, 0, 0);
+    line("SIGSEGV status", st);
 
     line("unknown syscall", sys(9999, 0, 0, 0, 0));
     sys(94, 3, 0, 0, 0);
