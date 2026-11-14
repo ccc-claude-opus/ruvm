@@ -1169,12 +1169,22 @@ impl Riscv64 {
                                         return Err(Ex::Stop(Stop::Signal));
                                     }
                                     Host::Sigreturn => return Err(Ex::Stop(Stop::Signal)),
+                                    Host::Thread(v) => {
+                                        self.x[10] = v;
+                                        self.pc = next;
+                                        return Err(Ex::Stop(Stop::Thread));
+                                    }
+                                    Host::Block(v) => {
+                                        self.x[10] = v;
+                                        self.pc = next;
+                                        return Err(Ex::Stop(Stop::Block));
+                                    }
                                 }
                             } else {
                                 let args = [self.x[10], self.x[11], self.x[12]];
                                 match host::syscall(bus, self.x[17], args) {
                                     Host::Exit(c) => return Err(Ex::Stop(Stop::Halt(c))),
-                                    Host::Ret(v) | Host::RetSp(v, _) | Host::Signal(v) => self.x[10] = v,
+                                    Host::Ret(v) | Host::RetSp(v, _) | Host::Signal(v) | Host::Thread(v) | Host::Block(v) => self.x[10] = v,
                                     Host::Exec | Host::Sigreturn => {}
                                 }
                             }

@@ -337,6 +337,19 @@ impl Aarch64 {
         self.set_flags((c.pstate >> 31 & 1 != 0, c.pstate >> 30 & 1 != 0, c.pstate >> 29 & 1 != 0, c.pstate >> 28 & 1 != 0));
     }
 
+    /// Thread pointer (TPIDR_EL0) and the syscall return register, for `-user` threads.
+    pub fn tls(&self) -> u64 {
+        self.sysreg(sr(3, 3, 13, 0, 2))
+    }
+
+    pub fn set_tls(&mut self, v: u64) {
+        self.sysregs.insert(sr(3, 3, 13, 0, 2), v);
+    }
+
+    pub fn set_ret(&mut self, v: u64) {
+        self.x[0] = v;
+    }
+
     pub fn set_sp(&mut self, sp: u64) {
         self.sp = sp;
     }
@@ -1035,6 +1048,16 @@ impl Aarch64 {
                     return Err(Stop::Signal.into());
                 }
                 Host::Sigreturn => return Err(Stop::Signal.into()),
+                Host::Thread(v) => {
+                    self.x[0] = v;
+                    self.pc = self.pc.wrapping_add(4);
+                    return Err(Stop::Thread.into());
+                }
+                Host::Block(v) => {
+                    self.x[0] = v;
+                    self.pc = self.pc.wrapping_add(4);
+                    return Err(Stop::Block.into());
+                }
             }
         } else if i & 0xffe0_001f == 0xd400_0002 || i & 0xffe0_001f == 0xd400_0003 {
             // ---- HVC / SMC: PSCI

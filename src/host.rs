@@ -17,6 +17,10 @@ pub enum Host {
     Signal(u64),
     /// `rt_sigreturn`: the machine restores the interrupted context.
     Sigreturn,
+    /// `clone(CLONE_THREAD)`: the machine creates the thread; the value is the new tid.
+    Thread(u64),
+    /// The calling thread blocks (or exits, or yields): its return value, then switch threads.
+    Block(u64),
     Exit(i32),
 }
 

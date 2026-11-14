@@ -549,7 +549,8 @@ fn user_mode_freestanding_program() {
              fork pipe read=10\nfrom child\nwait4 pid ok=1\nchild status=1792\nwait4 no children=-10\n\
              exec'd image\nexec status=2304\nexec missing=-2\n\
              sigaction=0\nhandler sig=10\nkill=0\nafter kill got=10\nblocked got=0\nhandler sig=10\nunblocked got=10\n\
-             ignored SIGUSR2 survived\nSIGTERM status=36608\nsegv handler 11\nSIGSEGV status=1280\nunknown syscall=-38\n"
+             ignored SIGUSR2 survived\nSIGTERM status=36608\nsegv handler 11\nSIGSEGV status=1280\n\
+             threads created=1\ncounter=2000\nwaiter saw=1\nthread tid differs=1\nfutex timeout=-110\nfutex value mismatch=-11\nunknown syscall=-38\n"
         );
         assert_eq!(out, want, "{elf}");
     }

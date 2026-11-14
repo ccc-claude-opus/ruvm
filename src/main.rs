@@ -185,7 +185,7 @@ fn main() {
                 eprintln!("ruvm: fatal: {msg}\nSegmentation fault");
                 exit(139)
             }
-            Stop::Reset | Stop::Exec | Stop::Signal => exit(0),
+            Stop::Reset | Stop::Exec | Stop::Signal | Stop::Thread | Stop::Block => exit(0),
         }
     }
 
@@ -270,6 +270,6 @@ fn main() {
             eprintln!("ruvm: fatal: {msg}");
             exit(1)
         }
-        Stop::Reset | Stop::Exec | Stop::Signal => exit(0), // -no-reboot
+        Stop::Reset | Stop::Exec | Stop::Signal | Stop::Thread | Stop::Block => exit(0), // -no-reboot
     }
 }

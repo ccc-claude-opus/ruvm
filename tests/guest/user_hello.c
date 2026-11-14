@@ -56,6 +56,37 @@ static volatile int got;
 static void on_sig(int sig) { got = sig; out("handler sig="); num(sig); out("\n"); }
 static void on_segv(int sig) { out("segv handler "); num(sig); out("\n"); sys(94, 5, 0, 0, 0); }
 
+
+// clone_thread(flags, stack, fn, arg, ctid): new thread runs fn(arg) on `stack`, then exits
+#if defined(__riscv)
+__asm__(".globl clone_thread\nclone_thread:\n"
+        " addi a1, a1, -16\n sd a2, 0(a1)\n sd a3, 8(a1)\n"
+        " li a7, 220\n li a2, 0\n li a3, 0\n ecall\n"
+        " bnez a0, 1f\n"
+        " ld a1, 0(sp)\n ld a0, 8(sp)\n jalr a1\n li a7, 93\n li a0, 0\n ecall\n"
+        "1: ret\n");
+#else
+__asm__(".globl clone_thread\nclone_thread:\n"
+        " sub x1, x1, #16\n stp x2, x3, [x1]\n"
+        " mov x8, #220\n mov x2, #0\n mov x3, #0\n svc #0\n"
+        " cbnz x0, 1f\n"
+        " ldp x1, x0, [sp]\n blr x1\n mov x8, #93\n mov x0, #0\n svc #0\n"
+        "1: ret\n");
+#endif
+i64 clone_thread(u64 flags, void *stack, void (*fn)(void *), void *arg, volatile int *ctid);
+
+#define CLONE_THREADFLAGS (0x100 | 0x200 | 0x400 | 0x800 | 0x10000 | 0x40000 | 0x200000) // VM FS FILES SIGHAND THREAD SYSVSEM CLEARTID
+static volatile unsigned counter, word, seen, other_tid;
+static char stacks[3][16384] __attribute__((aligned(16)));
+static void bump(void *arg) {
+    for (int i = 0; i < 1000; i++) __atomic_fetch_add(&counter, 1, __ATOMIC_SEQ_CST);
+    other_tid = sys(178, 0, 0, 0, 0);
+}
+static void waiter(void *arg) {
+    while (word == 0) sys6(98, (u64)&word, 0 /* FUTEX_WAIT */, 0, 0, 0, 0);
+    seen = word;
+}
+
 void start_c(u64 *sp) {
     i64 argc = sp[0];
     char **argv = (char **)(sp + 1);
@@ -190,6 +221,25 @@ void start_c(u64 *sp) {
     }
     sys6(260, pid, (u64)&st, 0, 0, 0, 0);
     line("SIGSEGV status", st);
+
+    // threads: clone(CLONE_THREAD), atomics shared through memory, futex wait/wake, join via CLEARTID, timeouts
+    volatile int tid1 = 1, tid2 = 1, tid3 = 1;
+    i64 t1 = clone_thread(CLONE_THREADFLAGS, stacks[0] + 16384, bump, 0, &tid1);
+    i64 t2 = clone_thread(CLONE_THREADFLAGS, stacks[1] + 16384, bump, 0, &tid2);
+    i64 t3 = clone_thread(CLONE_THREADFLAGS, stacks[2] + 16384, waiter, 0, &tid3);
+    line("threads created", t1 > 0 && t2 > 0 && t3 > 0 && t1 != t2);
+    word = 1;
+    sys6(98, (u64)&word, 1 /* FUTEX_WAKE */, 1, 0, 0, 0);
+    while (tid1) sys6(98, (u64)&tid1, 0, tid1, 0, 0, 0);
+    while (tid2) sys6(98, (u64)&tid2, 0, tid2, 0, 0, 0);
+    while (tid3) sys6(98, (u64)&tid3, 0, tid3, 0, 0, 0);
+    line("counter", counter);
+    line("waiter saw", seen);
+    line("thread tid differs", other_tid != (u64)sys(178, 0, 0, 0, 0));
+    u64 to[2] = {0, 20000000}; // 20 ms
+    volatile unsigned never = 5;
+    line("futex timeout", sys6(98, (u64)&never, 0, 5, (u64)to, 0, 0));
+    line("futex value mismatch", sys6(98, (u64)&never, 0, 6, 0, 0, 0));
 
     line("unknown syscall", sys(9999, 0, 0, 0, 0));
     sys(94, 3, 0, 0, 0);

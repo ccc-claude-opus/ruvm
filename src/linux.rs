@@ -54,7 +54,46 @@ pub struct LinuxUser {
     pub signal_op: Option<SignalOp>,
     /// Address of the `rt_sigreturn` trampoline (`mov a7, 139; ecall`).
     tramp: u64,
+    /// Threads (index = CPU index in the machine); `cur` is the one that is running.
+    threads: Vec<Thread>,
+    pub cur: usize,
+    live: usize,
+    waiters: Vec<Waiter>,
+    /// A thread requested by `clone(CLONE_THREAD)`, created by the machine.
+    pub pending_thread: Option<NewThread>,
 }
+
+#[derive(Clone, Copy, PartialEq)]
+enum ThState {
+    Run,
+    Blocked,
+    Dead,
+}
+
+struct Thread {
+    tid: u32,
+    state: ThState,
+    /// CLONE_CHILD_CLEARTID / set_tid_address: zeroed and futex-woken when the thread exits.
+    clear_tid: u64,
+}
+
+/// A thread blocked in `futex(WAIT)` (addr != 0 or `sleep`) with an optional deadline.
+struct Waiter {
+    thread: usize,
+    addr: u64,
+    bitset: u32,
+    deadline: Option<Instant>,
+    /// nanosleep: a timeout is the normal outcome (returns 0), not ETIMEDOUT.
+    sleep: bool,
+}
+
+pub struct NewThread {
+    pub stack: u64,
+    pub tls: u64,
+    pub set_tls: bool,
+}
+
+const MAX_THREADS: usize = 256;
 
 #[derive(Clone, Copy, Default)]
 struct SigAction {
@@ -109,6 +148,10 @@ pub enum Sys {
     Sigreturn,
     /// Return a value, then run a signal handler.
     Signal(i64),
+    /// A thread was created (its tid).
+    Thread(i64),
+    /// The calling thread blocked, exited or yielded; the value is returned to it when it runs again.
+    Block(i64),
 }
 
 /// Serve a system call for the CPU: a `host::Host` result (exit, or the return value).
@@ -133,6 +176,8 @@ pub fn syscall(bus: &mut Bus, nr: u64, args: [u64; 6]) -> crate::host::Host {
             Sys::RetSp(v, sp) => eprintln!("syscall {nr} = {v} (sp {sp:#x})"),
             Sys::Sigreturn => eprintln!("syscall {nr} rt_sigreturn"),
             Sys::Signal(v) => eprintln!("syscall {nr} = {v}, then a signal handler"),
+            Sys::Thread(v) => eprintln!("syscall {nr} = new thread {v}"),
+            Sys::Block(_) => eprintln!("syscall {nr} blocks / yields thread {}", u.cur),
         }
     }
     bus.user = Some(u);
@@ -143,6 +188,8 @@ pub fn syscall(bus: &mut Bus, nr: u64, args: [u64; 6]) -> crate::host::Host {
         Sys::RetSp(v, sp) => crate::host::Host::RetSp(v as u64, sp),
         Sys::Sigreturn => crate::host::Host::Sigreturn,
         Sys::Signal(v) => crate::host::Host::Signal(v as u64),
+        Sys::Thread(v) => crate::host::Host::Thread(v as u64),
+        Sys::Block(v) => crate::host::Host::Block(v as u64),
     }
 }
 
@@ -196,6 +243,11 @@ impl LinuxUser {
             pending: 0,
             signal_op: None,
             tramp: 0,
+            threads: vec![Thread { tid: std::process::id(), state: ThState::Run, clear_tid: 0 }],
+            cur: 0,
+            live: 1,
+            waiters: Vec::new(),
+            pending_thread: None,
         }
     }
 
@@ -521,6 +573,7 @@ impl LinuxUser {
 
     pub fn syscall(&mut self, bus: &mut Bus, nr: u64, a: [u64; 6]) -> Sys {
         let r = match nr {
+            93 if self.live > 1 => return self.thread_exit(bus),
             93 | 94 => return Sys::Exit(a[0] as i32),
             // read / write / readv / writev / pread / pwrite
             63 | 67 => {
@@ -886,14 +939,11 @@ impl LinuxUser {
                 }
             }
             226 | 233 | 132 | 99 | 100 | 167 => 0, // mprotect madvise sigprocmask sigaction sigaltstack robust_list ...
-            96 => std::process::id() as i64, // set_tid_address -> tid
-            98 => {
-                // futex: single thread, so a wait could never be woken
-                match a[1] & 0x7f {
-                    0 | 9 => -11, // WAIT -> EAGAIN
-                    _ => 0,
-                }
+            96 => {
+                self.threads[self.cur].clear_tid = a[0];
+                self.threads[self.cur].tid as i64
             }
+            98 => return self.sys_futex(bus, a),
             113 => {
                 let (s, ns) = if a[0] == 0 {
                     let d = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
@@ -919,6 +969,11 @@ impl LinuxUser {
                     Some(b) => {
                         let s = u64::from_le_bytes(b[..8].try_into().unwrap());
                         let ns = u64::from_le_bytes(b[8..].try_into().unwrap());
+                        if self.live > 1 && !(nr == 115 && a[1] & 1 != 0) {
+                            // other threads exist: block this one with a deadline instead of stalling them all
+                            let d = std::time::Duration::new(s, ns.min(999_999_999) as u32);
+                            return self.block_on(bus, 0, 0, Some(Instant::now() + d), true);
+                        }
                         if !(nr == 115 && a[1] & 1 != 0) {
                             std::thread::sleep(std::time::Duration::new(s, ns.min(999_999_999) as u32));
                         }
@@ -927,6 +982,7 @@ impl LinuxUser {
                     None => EFAULT,
                 }
             }
+            124 if self.live > 1 => return Sys::Block(0),
             124 => 0,
             160 => {
                 let mut b = vec![0u8; 65 * 6];
@@ -937,7 +993,8 @@ impl LinuxUser {
                 Self::put(bus, a[0], &b)
             }
             166 => 0o22,
-            172 | 178 => std::process::id() as i64,
+            172 => std::process::id() as i64,
+            178 => self.threads[self.cur].tid as i64,
             173 => std::os::unix::process::parent_id() as i64,
             174 | 175 | 176 | 177 => 1000,
             261 => {
@@ -1038,12 +1095,20 @@ impl LinuxUser {
                 // clone: fork semantics via a host fork (threads are not supported)
                 let flags = a[0];
                 if flags & 0x10000 != 0 {
-                    ENOSYS
+                    return self.sys_clone_thread(bus, a);
                 } else {
                     let pid = unsafe { fork() };
                     if pid < 0 {
                         errno(&std::io::Error::last_os_error())
                     } else if pid == 0 {
+                        // the child has only the calling thread
+                        for (i, t) in self.threads.iter_mut().enumerate() {
+                            if i != self.cur {
+                                t.state = ThState::Dead;
+                            }
+                        }
+                        self.live = 1;
+                        self.waiters.clear();
                         let me = std::process::id();
                         if flags & 0x0100_0000 != 0 && a[4] != 0 {
                             Self::put(bus, a[4], &me.to_le_bytes()); // CLONE_CHILD_SETTID
@@ -1143,6 +1208,187 @@ impl LinuxUser {
         nu.fds = std::mem::take(&mut self.fds).into_iter().enumerate().map(|(i, f)| f.filter(|_| keep.contains(&i))).collect();
         self.pending_exec = Some(ExecReq { bus: nb, entry: img.entry, sp: img.sp });
         0
+    }
+
+    fn runnable_state(&self, t: usize) -> bool {
+        self.threads.get(t).is_some_and(|t| t.state == ThState::Run)
+    }
+
+    /// Can thread `t` execute instructions now?
+    pub fn runnable(&self, t: usize) -> bool {
+        self.runnable_state(t)
+    }
+
+    fn wake(&mut self, thread: usize) {
+        if self.threads[thread].state == ThState::Blocked {
+            self.threads[thread].state = ThState::Run;
+        }
+    }
+
+    /// Block the calling thread. It resumes with 0 when woken (the machine supplies the value for a timeout).
+    fn block_on(&mut self, _bus: &mut Bus, addr: u64, bitset: u32, deadline: Option<Instant>, sleep: bool) -> Sys {
+        let thread = self.cur;
+        self.threads[thread].state = ThState::Blocked;
+        self.waiters.push(Waiter { thread, addr, bitset, deadline, sleep });
+        Sys::Block(0)
+    }
+
+    /// Wake waiters whose deadline passed; with `block`, first sleep until the earliest deadline.
+    /// Returns (thread, return value) pairs for the machine to patch into the CPUs.
+    pub fn expire_waiters(&mut self, block: bool) -> Vec<(usize, i64)> {
+        if block {
+            if let Some(d) = self.waiters.iter().filter_map(|w| w.deadline).min() {
+                let now = Instant::now();
+                if d > now {
+                    std::thread::sleep(d - now);
+                }
+            }
+        }
+        let now = Instant::now();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < self.waiters.len() {
+            if self.waiters[i].deadline.is_some_and(|d| d <= now) {
+                let w = self.waiters.remove(i);
+                self.wake(w.thread);
+                out.push((w.thread, if w.sleep { 0 } else { -110 })); // ETIMEDOUT
+            } else {
+                i += 1;
+            }
+        }
+        out
+    }
+
+    /// Wake up to `n` threads waiting on `addr` whose bitset matches; returns how many.
+    fn futex_wake(&mut self, addr: u64, n: u64, bitset: u32) -> i64 {
+        let mut woken = 0;
+        let mut i = 0;
+        while i < self.waiters.len() && woken < n {
+            if !self.waiters[i].sleep && self.waiters[i].addr == addr && self.waiters[i].bitset & bitset != 0 {
+                let w = self.waiters.remove(i);
+                self.wake(w.thread);
+                woken += 1;
+            } else {
+                i += 1;
+            }
+        }
+        woken as i64
+    }
+
+    fn now_ns(&self, realtime: bool) -> u128 {
+        if realtime {
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos()
+        } else {
+            self.start.elapsed().as_nanos() + 1_000_000_000_000
+        }
+    }
+
+    fn sys_futex(&mut self, bus: &mut Bus, a: [u64; 6]) -> Sys {
+        let (uaddr, op, val) = (a[0], a[1], a[2] as u32);
+        let cmd = op & 0x7f;
+        let word = |bus: &Bus, addr: u64| bus.guest_bytes(addr, 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+        match cmd {
+            0 | 9 => {
+                // FUTEX_WAIT (relative timeout) / FUTEX_WAIT_BITSET (absolute timeout)
+                let Some(cur) = word(bus, uaddr) else { return Sys::Ret(EFAULT) };
+                if cur != val {
+                    return Sys::Ret(-11); // EAGAIN
+                }
+                let deadline = if a[3] == 0 {
+                    None
+                } else {
+                    let Some(b) = bus.guest_bytes(a[3], 16) else { return Sys::Ret(EFAULT) };
+                    let ns = u64::from_le_bytes(b[..8].try_into().unwrap()) as u128 * 1_000_000_000 + u64::from_le_bytes(b[8..].try_into().unwrap()) as u128;
+                    let rel = if cmd == 0 { ns } else { ns.saturating_sub(self.now_ns(op & 256 != 0)) };
+                    Some(Instant::now() + std::time::Duration::from_nanos(rel.min(u64::MAX as u128) as u64))
+                };
+                let bitset = if cmd == 9 { a[5] as u32 } else { u32::MAX };
+                if self.live <= 1 && deadline.is_none() {
+                    return Sys::Ret(-11); // single thread: nobody could ever wake it
+                }
+                self.block_on(bus, uaddr, bitset, deadline, false)
+            }
+            1 | 10 => Sys::Ret(self.futex_wake(uaddr, val as u64, if cmd == 10 { a[5] as u32 } else { u32::MAX })),
+            3 | 4 => {
+                // FUTEX_REQUEUE / CMP_REQUEUE(uaddr, op, nwake, nrequeue, uaddr2, cmpval)
+                if cmd == 4 && word(bus, uaddr) != Some(a[5] as u32) {
+                    return Sys::Ret(-11);
+                }
+                let woken = self.futex_wake(uaddr, val as u64, u32::MAX);
+                let mut moved = 0;
+                for w in self.waiters.iter_mut() {
+                    if moved < a[3] && !w.sleep && w.addr == uaddr {
+                        w.addr = a[4];
+                        moved += 1;
+                    }
+                }
+                Sys::Ret(woken + moved as i64)
+            }
+            5 => {
+                // FUTEX_WAKE_OP(uaddr, op, nwake, nwake2, uaddr2, encoded op)
+                let enc = a[5] as u32;
+                let (opn, cmp, mut oparg, cmparg) = (enc >> 28 & 7, enc >> 24 & 15, (enc >> 12 & 0xfff) as i32, (enc & 0xfff) as i32);
+                if enc >> 28 & 8 != 0 {
+                    oparg = 1 << oparg;
+                }
+                let Some(old) = word(bus, a[4]) else { return Sys::Ret(EFAULT) };
+                let new = match opn {
+                    0 => oparg as u32,
+                    1 => old.wrapping_add(oparg as u32),
+                    2 => old | oparg as u32,
+                    3 => old & !(oparg as u32),
+                    _ => old ^ oparg as u32,
+                };
+                Self::put(bus, a[4], &new.to_le_bytes());
+                let mut n = self.futex_wake(uaddr, val as u64, u32::MAX);
+                let (o, c) = (old as i32, cmparg);
+                let hit = match cmp {
+                    0 => o == c,
+                    1 => o != c,
+                    2 => o < c,
+                    3 => o <= c,
+                    4 => o > c,
+                    _ => o >= c,
+                };
+                if hit {
+                    n += self.futex_wake(a[4], a[3], u32::MAX);
+                }
+                Sys::Ret(n)
+            }
+            _ => Sys::Ret(ENOSYS),
+        }
+    }
+
+    /// clone(CLONE_THREAD): the machine creates the CPU after this returns.
+    fn sys_clone_thread(&mut self, bus: &mut Bus, a: [u64; 6]) -> Sys {
+        let flags = a[0];
+        if flags & 0x100 == 0 || self.threads.len() >= MAX_THREADS {
+            return Sys::Ret(if flags & 0x100 == 0 { EINVAL } else { -11 });
+        }
+        let tid = std::process::id() + ((self.threads.len() as u32) << 22);
+        self.threads.push(Thread { tid, state: ThState::Run, clear_tid: if flags & 0x20_0000 != 0 { a[4] } else { 0 } });
+        self.live += 1;
+        if flags & 0x10_0000 != 0 && a[2] != 0 {
+            Self::put(bus, a[2], &tid.to_le_bytes()); // CLONE_PARENT_SETTID
+        }
+        if flags & 0x0100_0000 != 0 && a[4] != 0 {
+            Self::put(bus, a[4], &tid.to_le_bytes()); // CLONE_CHILD_SETTID
+        }
+        self.pending_thread = Some(NewThread { stack: a[1], tls: a[3], set_tls: flags & 0x8_0000 != 0 });
+        Sys::Thread(tid as i64)
+    }
+
+    /// `exit` of one thread while others live on: clear_child_tid, wake joiners, never run again.
+    fn thread_exit(&mut self, bus: &mut Bus) -> Sys {
+        let t = self.cur;
+        self.threads[t].state = ThState::Dead;
+        self.live -= 1;
+        let ctid = self.threads[t].clear_tid;
+        if ctid != 0 {
+            Self::put(bus, ctid, &0u32.to_le_bytes());
+            self.futex_wake(ctid, u64::MAX, u32::MAX);
+        }
+        Sys::Block(0)
     }
 
     /// A signal to ourselves. Returns true if the default action ends the program.

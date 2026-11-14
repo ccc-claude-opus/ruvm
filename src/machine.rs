@@ -27,6 +27,10 @@ pub enum Stop {
     Exec,
     /// User mode: a signal handler must run or return (handled inside `Machine::run`).
     Signal,
+    /// User mode: `clone(CLONE_THREAD)` created a thread (handled inside `Machine::run`).
+    Thread,
+    /// User mode: the running thread blocked, exited or yielded (handled inside `Machine::run`).
+    Block,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -590,6 +594,7 @@ impl Machine {
             Arch::Riscv64 => Box::new(Riscv64::new(0)) as Box<dyn Cpu>,
             Arch::Aarch64 => Box::new(Aarch64::new(0)) as Box<dyn Cpu>,
         }];
+        self.ncpus = self.cpus.len();
         self.start_cpus(entry);
         match self.arch {
             Arch::Riscv64 => {
@@ -610,27 +615,86 @@ impl Machine {
     }
 
     /// User mode: enter a signal handler or return from one (see `linux::LinuxUser::signal_enter`).
-    fn finish_signal(&mut self) -> Result<(), String> {
+    fn finish_signal(&mut self, id: usize) -> Result<(), String> {
         let arch = self.arch;
         let mut ctx = match arch {
-            Arch::Riscv64 => self.cpus[0].as_any().downcast_mut::<Riscv64>().unwrap().user_ctx(),
-            Arch::Aarch64 => self.cpus[0].as_any().downcast_mut::<Aarch64>().unwrap().user_ctx(),
+            Arch::Riscv64 => self.cpus[id].as_any().downcast_mut::<Riscv64>().unwrap().user_ctx(),
+            Arch::Aarch64 => self.cpus[id].as_any().downcast_mut::<Aarch64>().unwrap().user_ctx(),
         };
         crate::linux::signal_step(&mut self.bus, arch, &mut ctx)?;
         match arch {
-            Arch::Riscv64 => self.cpus[0].as_any().downcast_mut::<Riscv64>().unwrap().set_user_ctx(&ctx),
-            Arch::Aarch64 => self.cpus[0].as_any().downcast_mut::<Aarch64>().unwrap().set_user_ctx(&ctx),
+            Arch::Riscv64 => self.cpus[id].as_any().downcast_mut::<Riscv64>().unwrap().set_user_ctx(&ctx),
+            Arch::Aarch64 => self.cpus[id].as_any().downcast_mut::<Aarch64>().unwrap().set_user_ctx(&ctx),
         }
         Ok(())
     }
 
     /// User mode: a fault (the emulator's `Stop::Fatal`) becomes SIGSEGV / SIGILL if the program has a handler for it.
-    fn fault_signal(&mut self, msg: &str) -> bool {
+    fn fault_signal(&mut self, id: usize, msg: &str) -> bool {
         let Some(u) = self.bus.user.as_mut() else { return false };
         if !u.arm_fault_signal(msg) {
             return false;
         }
-        self.finish_signal().is_ok()
+        self.finish_signal(id).is_ok()
+    }
+
+    /// User mode: create the thread requested by `clone(CLONE_THREAD)` on thread `id`: a new CPU with a
+    /// copy of the parent's registers, returning 0, on the new stack and with the new thread pointer.
+    fn finish_thread(&mut self, id: usize) -> Result<(), String> {
+        let nt = self.bus.user.as_mut().and_then(|u| u.pending_thread.take()).ok_or("clone without a pending thread")?;
+        let cpu: Box<dyn Cpu> = match self.arch {
+            Arch::Riscv64 => {
+                let mut ctx = self.cpus[id].as_any().downcast_mut::<Riscv64>().unwrap().user_ctx();
+                ctx.x[10] = 0;
+                if nt.stack != 0 {
+                    ctx.x[2] = nt.stack;
+                }
+                if nt.set_tls {
+                    ctx.x[4] = nt.tls;
+                }
+                let mut c = Riscv64::new(0);
+                c.set_user_ctx(&ctx);
+                c.enable_fp();
+                Box::new(c)
+            }
+            Arch::Aarch64 => {
+                let parent = self.cpus[id].as_any().downcast_mut::<Aarch64>().unwrap();
+                let (mut ctx, tls) = (parent.user_ctx(), parent.tls());
+                ctx.x[0] = 0;
+                if nt.stack != 0 {
+                    ctx.sp = nt.stack;
+                }
+                let mut c = Aarch64::new(0);
+                c.set_user_ctx(&ctx);
+                c.set_tls(if nt.set_tls { nt.tls } else { tls });
+                Box::new(c)
+            }
+        };
+        self.cpus.push(cpu);
+        self.ncpus = self.cpus.len();
+        Ok(())
+    }
+
+    /// User mode: wake threads whose futex / sleep timeout has passed (`block` = wait for the earliest one).
+    fn wake_timed_waiters(&mut self, block: bool) -> bool {
+        let Some(u) = self.bus.user.as_mut() else { return false };
+        let woken = u.expire_waiters(block);
+        for &(t, ret) in &woken {
+            match self.arch {
+                Arch::Riscv64 => self.cpus[t].as_any().downcast_mut::<Riscv64>().unwrap().set_reg(10, ret as u64),
+                Arch::Aarch64 => self.cpus[t].as_any().downcast_mut::<Aarch64>().unwrap().set_ret(ret as u64),
+            }
+        }
+        !woken.is_empty()
+    }
+
+    /// Every thread is blocked: sleep until the next timeout, or fail if nothing can ever wake them.
+    fn user_idle(&mut self) -> Result<(), String> {
+        if self.wake_timed_waiters(true) {
+            Ok(())
+        } else {
+            Err("deadlock: every thread is blocked".into())
+        }
     }
 
     /// Load a raw binary at `addr` and start executing there.
@@ -690,7 +754,16 @@ impl Machine {
         let quantum: u64 = if self.ncpus == 1 { 4096 } else { 512 };
         loop {
             let mut ran_any = false;
+            if self.bus.user.is_some() {
+                self.wake_timed_waiters(false);
+            }
             for id in 0..self.ncpus {
+                if let Some(u) = self.bus.user.as_mut() {
+                    if !u.runnable(id) {
+                        continue; // a user-mode thread that is blocked or finished
+                    }
+                    u.cur = id;
+                }
                 let left = max_insns.map_or(quantum, |m| m.saturating_sub(self.insns).min(quantum));
                 if left == 0 {
                     return Stop::Limit;
@@ -713,18 +786,31 @@ impl Machine {
                             break; // the CPU was replaced: restart the round
                         }
                         Stop::Signal => {
-                            if let Err(e) = self.finish_signal() {
+                            if let Err(e) = self.finish_signal(id) {
                                 return Stop::Fatal(e);
                             }
                             break;
                         }
-                        Stop::Fatal(msg) if self.fault_signal(msg) => break, // a SIGSEGV/SIGILL handler took over
+                        Stop::Thread => {
+                            if let Err(e) = self.finish_thread(id) {
+                                return Stop::Fatal(e);
+                            }
+                        }
+                        Stop::Block => {} // the thread's state was updated by the system call; just move on
+                        Stop::Fatal(msg) if self.fault_signal(id, msg) => break, // a SIGSEGV/SIGILL handler took over
                         _ => return s,
                     }
                 }
                 if self.bus.reset {
                     return Stop::Reset;
                 }
+            }
+            if !ran_any && self.bus.user.is_some() {
+                // every user-mode thread is blocked: wait for the earliest timeout, or report a deadlock
+                if let Err(e) = self.user_idle() {
+                    return Stop::Fatal(e);
+                }
+                continue;
             }
             if !ran_any {
                 // every CPU sleeps or is off
