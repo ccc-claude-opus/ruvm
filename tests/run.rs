@@ -101,6 +101,41 @@ fn expected(name: &str) -> String {
     std::fs::read_to_string(format!("{}/tests/guest/prebuilt/{}", env!("CARGO_MANIFEST_DIR"), name)).unwrap()
 }
 
+/// How a Linux test runs the guest: ruvm's interpreter, or the host's hypervisor.
+#[derive(Clone, Copy, PartialEq)]
+enum Exec {
+    Tcg,
+    #[cfg_attr(not(all(target_os = "macos", target_arch = "aarch64")), allow(dead_code))]
+    Hvf,
+}
+
+/// The ruvm command for `exec`. Hypervisor.framework only runs signed programs, so `Hvf` uses a
+/// copy of the binary signed with the hypervisor entitlement (as tools/hvf-sign.sh does).
+fn ruvm(exec: Exec) -> Command {
+    static SIGNED: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    match exec {
+        Exec::Tcg => Command::new(env!("CARGO_BIN_EXE_ruvm")),
+        Exec::Hvf => {
+            let bin = SIGNED.get_or_init(|| {
+                let bin = std::env::temp_dir().join(format!("ruvm-hvf-{}", std::process::id()));
+                std::fs::copy(env!("CARGO_BIN_EXE_ruvm"), &bin).unwrap();
+                let ent = format!("{}/tools/hvf.entitlements", env!("CARGO_MANIFEST_DIR"));
+                let st = Command::new("codesign").args(["--sign", "-", "--force", "--entitlements", &ent]).arg(&bin).status().unwrap();
+                assert!(st.success(), "codesign failed");
+                bin
+            });
+            let mut c = Command::new(bin);
+            c.args(["-accel", "hvf"]);
+            c
+        }
+    }
+}
+
+/// Instruction limit for the interpreter (with a hypervisor nothing is counted).
+fn icount(exec: Exec, n: &'static str) -> Vec<&'static str> {
+    if exec == Exec::Tcg { vec!["-icount", n] } else { vec![] }
+}
+
 /// Output of a gcc-compiled C program must equal the natively compiled build's output.
 #[test]
 fn gcc_compiled_selftest_matches_native() {
@@ -290,7 +325,7 @@ fn debian_linux_aarch64_boots_to_shell() {
 /// Boot a Debian kernel with the small initramfs and an ext4 root on virtio-blk
 /// (tools/linux/mkroot.sh): the first boot counts itself on the disk and reboots, the
 /// second boot must see the persisted counter. Also checks RTC (fixed start time) and virtio-rng.
-fn linux_root_reboot(arch: &str, dir: &str, mem: &str, console: &str) {
+fn linux_root_reboot(exec: Exec, arch: &str, dir: &str, mem: &str, console: &str) {
     let base = env!("CARGO_MANIFEST_DIR");
     let root = format!("{base}/tests/guest/out/linux/root/{dir}");
     let kernel = format!("{base}/tests/guest/out/linux/debian/{dir}/linux");
@@ -298,12 +333,13 @@ fn linux_root_reboot(arch: &str, dir: &str, mem: &str, console: &str) {
         eprintln!("skipped: run tools/linux/fetch-debian.sh {dir} and tools/linux/mkroot.sh {dir} first");
         return;
     }
-    let tmp = std::env::temp_dir().join(format!("ruvm-root-{dir}-{}.ext4", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("ruvm-root-{dir}-{}-{}.ext4", std::process::id(), exec as u8));
     std::fs::copy(format!("{root}/root.ext4"), &tmp).unwrap();
-    let out = Command::new(env!("CARGO_BIN_EXE_ruvm"))
+    let out = ruvm(exec)
         .args(["-M", arch, "-m", mem, "-kernel", &kernel, "-initrd", &format!("{root}/initramfs.cpio.gz")])
         .args(["-drive", &format!("file={}", tmp.display()), "-rng", "-rng-seed", "7", "-rtc", "1893456000"])
-        .args(["-append", &format!("console={console} rdinit=/init ruvm.test=reboot"), "-icount", "60000000000"])
+        .args(["-append", &format!("console={console} rdinit=/init ruvm.test=reboot")])
+        .args(icount(exec, "60000000000"))
         .output()
         .unwrap();
     std::fs::remove_file(&tmp).ok();
@@ -325,19 +361,27 @@ fn linux_root_reboot(arch: &str, dir: &str, mem: &str, console: &str) {
 #[test]
 #[ignore]
 fn linux_ext4_root_reboot_riscv64() {
-    linux_root_reboot("riscv64", "riscv64", "256", "ttyS0");
+    linux_root_reboot(Exec::Tcg, "riscv64", "riscv64", "256", "ttyS0");
 }
 
 #[test]
 #[ignore]
 fn linux_ext4_root_reboot_aarch64() {
-    linux_root_reboot("aarch64", "arm64", "512", "ttyAMA0");
+    linux_root_reboot(Exec::Tcg, "aarch64", "arm64", "512", "ttyAMA0");
+}
+
+/// The same with Hypervisor.framework: the guest runs on the host CPU (reboot = a new VM).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+#[ignore]
+fn linux_ext4_root_reboot_aarch64_hvf() {
+    linux_root_reboot(Exec::Hvf, "aarch64", "arm64", "512", "ttyAMA0");
 }
 
 /// Boot with a virtio-net device and the user-mode network: the guest gets a DHCP lease,
 /// pings the gateway, fetches a page from a host HTTP server (TCP through the stack), talks to a
 /// host TFTP server (UDP), and accepts a connection the host opens through `hostfwd`.
-fn linux_network(arch: &str, dir: &str, mem: &str, console: &str) {
+fn linux_network(exec: Exec, arch: &str, dir: &str, mem: &str, console: &str) {
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::{TcpListener, TcpStream, UdpSocket};
     use std::process::Stdio;
@@ -373,13 +417,13 @@ fn linux_network(arch: &str, dir: &str, mem: &str, console: &str) {
         }
     });
     let fwd = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port(); // a free port
-    let tmp = std::env::temp_dir().join(format!("ruvm-net-{dir}-{}.ext4", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("ruvm-net-{dir}-{}-{}.ext4", std::process::id(), exec as u8));
     std::fs::copy(format!("{root}/root.ext4"), &tmp).unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ruvm"))
+    let mut child = ruvm(exec)
         .args(["-M", arch, "-m", mem, "-kernel", &kernel, "-initrd", &format!("{root}/initramfs.cpio.gz")])
         .args(["-drive", &format!("file={}", tmp.display()), "-nic", &format!("user,hostfwd=tcp::{fwd}-:7000")])
         .args(["-append", &format!("console={console} rdinit=/init ruvm.test=net ruvm.port={hport} ruvm.uport={uport}")])
-        .args(["-icount", "100000000000"])
+        .args(icount(exec, "100000000000"))
         .stdout(Stdio::piped())
         .spawn()
         .unwrap();
@@ -413,13 +457,20 @@ fn linux_network(arch: &str, dir: &str, mem: &str, console: &str) {
 #[test]
 #[ignore]
 fn linux_user_network_riscv64() {
-    linux_network("riscv64", "riscv64", "256", "ttyS0");
+    linux_network(Exec::Tcg, "riscv64", "riscv64", "256", "ttyS0");
 }
 
 #[test]
 #[ignore]
 fn linux_user_network_aarch64() {
-    linux_network("aarch64", "arm64", "512", "ttyAMA0");
+    linux_network(Exec::Tcg, "aarch64", "arm64", "512", "ttyAMA0");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+#[ignore]
+fn linux_user_network_aarch64_hvf() {
+    linux_network(Exec::Hvf, "aarch64", "arm64", "512", "ttyAMA0");
 }
 
 fn run_elf_smp(arch: &str, name: &str, cpus: &str) -> String {
@@ -462,7 +513,7 @@ fn xv6_boots_on_two_harts() {
     }
 }
 
-fn linux_smp(arch: &str, dir: &str, console: &str) {
+fn linux_smp(exec: Exec, arch: &str, dir: &str, console: &str) {
     let base = env!("CARGO_MANIFEST_DIR");
     let root = format!("{base}/tests/guest/out/linux/root/{dir}");
     let kernel = format!("{base}/tests/guest/out/linux/debian/{dir}/linux");
@@ -470,13 +521,14 @@ fn linux_smp(arch: &str, dir: &str, console: &str) {
         eprintln!("skipped: run tools/linux/fetch-debian.sh {dir} and tools/linux/mkroot.sh {dir} first");
         return;
     }
-    let tmp = std::env::temp_dir().join(format!("ruvm-smp-{dir}-{}.ext4", std::process::id()));
+    let tmp = std::env::temp_dir().join(format!("ruvm-smp-{dir}-{}-{}.ext4", std::process::id(), exec as u8));
     std::fs::copy(format!("{root}/root.ext4"), &tmp).unwrap();
     let script = "echo NPROC=$(nproc); for i in 1 2 3 4; do (n=0; while [ $n -lt 2000 ]; do n=$((n+1)); done; echo job$i-done) & done; wait; echo ALLDONE\\n";
-    let out = Command::new(env!("CARGO_BIN_EXE_ruvm"))
+    let out = ruvm(exec)
         .args(["-M", arch, "-m", "512", "-smp", "4", "-kernel", &kernel, "-initrd", &format!("{root}/initramfs.cpio.gz")])
         .args(["-drive", &format!("file={}", tmp.display()), "-append", &format!("console={console} rdinit=/init")])
-        .args(["-send-after", "# ", script, "-send-after", "ALLDONE", "\\npoweroff -f\\n", "-icount", "100000000000"])
+        .args(["-send-after", "# ", script, "-send-after", "ALLDONE", "\\npoweroff -f\\n"])
+        .args(icount(exec, "100000000000"))
         .output()
         .unwrap();
     std::fs::remove_file(&tmp).ok();
@@ -491,13 +543,20 @@ fn linux_smp(arch: &str, dir: &str, console: &str) {
 #[test]
 #[ignore]
 fn linux_smp_riscv64() {
-    linux_smp("riscv64", "riscv64", "ttyS0");
+    linux_smp(Exec::Tcg, "riscv64", "riscv64", "ttyS0");
 }
 
 #[test]
 #[ignore]
 fn linux_smp_aarch64() {
-    linux_smp("aarch64", "arm64", "ttyAMA0");
+    linux_smp(Exec::Tcg, "aarch64", "arm64", "ttyAMA0");
+}
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[test]
+#[ignore]
+fn linux_smp_aarch64_hvf() {
+    linux_smp(Exec::Hvf, "aarch64", "arm64", "ttyAMA0");
 }
 
 /// Zba / Zbb / Zbc / Zbs / Zicond over edge-case operands (66 instruction forms).

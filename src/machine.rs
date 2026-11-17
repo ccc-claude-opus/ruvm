@@ -79,6 +79,8 @@ pub struct Machine {
     boot: Option<BootRecord>,
     /// Fixed start time of the RTC (seconds since the epoch); `None` = host clock.
     rtc_epoch: Option<u64>,
+    /// How instructions are executed: the interpreter or the host's hypervisor (`-accel`).
+    pub accel: crate::accel::Accel,
 }
 
 /// A virtio device attached to the board.
@@ -162,6 +164,7 @@ impl Machine {
             devices: Vec::new(),
             boot: None,
             rtc_epoch: None,
+            accel: crate::accel::Accel::Tcg,
         };
         m.bus.interactive = interactive;
         m.build_board();
@@ -751,6 +754,9 @@ impl Machine {
     /// sleeping (WFI) or powered-off CPUs are skipped, and when every CPU is idle the board
     /// clock jumps to the earliest wake-up time.
     pub fn run(&mut self, max_insns: Option<u64>) -> Stop {
+        if self.accel != crate::accel::Accel::Tcg {
+            return crate::accel::run(self);
+        }
         let quantum: u64 = if self.ncpus == 1 { 4096 } else { 512 };
         loop {
             let mut ran_any = false;

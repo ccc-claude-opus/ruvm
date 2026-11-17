@@ -16,6 +16,7 @@ flowchart LR
     v10 --> v11["v0.11<br/>指令集補完"]
     v11 --> v10f["v1.0<br/>整合"]
     v10f --> v11u["v1.1<br/>-user"]
+    v11u --> v12["v1.2<br/>-accel hvf/kvm"]
 ```
 
 | 版本 | 內容 | 文件 |
@@ -33,11 +34,12 @@ flowchart LR
 | v0.11 | FP 估計、CRC32、AES、SHA、CASP；RISC-V B、Zicond、Zicbo*、Svinval、Sv48、PMP | [v0.11](v0.11.md) |
 | v1.0 | CI 腳本、清理、文件 | [v1.0](v1.0.md) |
 | v1.1 | 使用者模式 `-user`：直接執行靜態 Linux ELF | [v1.1](v1.1.md) |
+| v1.2 | 硬體虛擬化 `-accel hvf` / `-accel kvm`：AArch64 客體直接在 AArch64 主機上執行，每個 vCPU 一條執行緒 | [v1.2](v1.2.md) |
 
 ## 1.0 之後
 
-1. **速度**：預解碼快取／基本區塊，之後再考慮 JIT（目前上限約 120 MIPS）。
+1. **速度**：直譯器的預解碼快取／基本區塊，之後再考慮 JIT（目前上限約 120 MIPS）。ARM 客體在 ARM 主機上已可用 `-accel`（v1.2）。
 2. **指令集**：RISC-V V、H；ARM EL2、SVE、PAuth。
 3. **裝置**：GICv3、PCI、virtio-gpu / input、9p。
-4. **真正的多執行緒 SMP**。
+4. **直譯器的多執行緒 SMP**（`-accel` 已是每個 vCPU 一條執行緒）。
 5. `-user` 的非同步訊號（`alarm`、`SIGCHLD`）。

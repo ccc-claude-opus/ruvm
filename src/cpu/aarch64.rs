@@ -17,6 +17,7 @@ use crate::bus::Bus;
 use crate::devices::Clint;
 use crate::host::{self, Host};
 use crate::machine::Stop;
+use crate::psci::Psci;
 use std::collections::HashMap;
 
 mod crypto;
@@ -392,6 +393,11 @@ impl Aarch64 {
             recheck: false,
             bitmask_cache: vec![(0, None); 256],
         }
+    }
+
+    /// General register `r` (31 reads as zero).
+    pub fn reg(&self, r: usize) -> u64 {
+        if r < 31 { self.x[r] } else { 0 }
     }
 
     pub fn set_reg(&mut self, r: usize, v: u64) {
@@ -1064,55 +1070,14 @@ impl Aarch64 {
             if self.el == 0 {
                 return Err(self.undef(i));
             }
-            const NOT_SUPPORTED: u64 = -1i64 as u64;
-            const INVALID_PARAMS: u64 = -2i64 as u64;
-            const ALREADY_ON: u64 = -4i64 as u64;
-            const ON_PENDING: u64 = -5i64 as u64;
-            let (a1, a2, a3) = (self.x[1], self.x[2], self.x[3]);
-            self.x[0] = match self.x[0] as u32 {
-                0x8400_0008 => return Err(Stop::Halt(0).into()), // SYSTEM_OFF
-                0x8400_0009 => return Err(Stop::Reset.into()),   // SYSTEM_RESET
-                0x8400_0000 => 0x0001_0001,                      // PSCI_VERSION 1.1
-                0x8400_0002 => {
-                    // CPU_OFF: this CPU powers down and never returns
-                    bus.ctl[self.id].parked = true;
+            match crate::psci::call(bus, self.id, [self.x[0], self.x[1], self.x[2], self.x[3]]) {
+                Psci::Ret(v) => self.x[0] = v,
+                Psci::Off => {
+                    self.x[0] = 0;
                     self.recheck = true;
-                    0
                 }
-                0x8400_0003 | 0xc400_0003 => {
-                    // CPU_ON(target_cpu, entry_point, context_id)
-                    let t = (a1 & 0xff) as usize;
-                    if a1 & !0xff != 0 && a1 & !0xff != 0x8000_0000 || t >= bus.ncpus {
-                        INVALID_PARAMS
-                    } else if bus.ctl[t].start.is_some() {
-                        ON_PENDING
-                    } else if !bus.ctl[t].parked {
-                        ALREADY_ON
-                    } else {
-                        bus.ctl[t].start = Some((a2, a3));
-                        0
-                    }
-                }
-                0x8400_0004 | 0xc400_0004 => {
-                    // AFFINITY_INFO: 0 = ON, 1 = OFF, 2 = ON_PENDING
-                    let t = (a1 & 0xff) as usize;
-                    if t >= bus.ncpus {
-                        INVALID_PARAMS
-                    } else if bus.ctl[t].start.is_some() {
-                        2
-                    } else {
-                        bus.ctl[t].parked as u64
-                    }
-                }
-                0x8400_0006 => 2, // MIGRATE_INFO_TYPE: trusted OS not present / not migratable
-                0x8400_000a => match a1 as u32 {
-                    // PSCI_FEATURES
-                    0x8400_0000 | 0x8400_0002 | 0x8400_0003 | 0xc400_0003 | 0x8400_0004 | 0xc400_0004 | 0x8400_0006
-                    | 0x8400_0008 | 0x8400_0009 | 0x8400_000a => 0,
-                    _ => NOT_SUPPORTED,
-                },
-                _ => NOT_SUPPORTED,
-            };
+                Psci::Stop(s) => return Err(s.into()),
+            }
         } else if i & 0xffe0_001f == 0xd440_0000 {
             // ---- HLT: stop the VM, exit code = x0
             return Err(Stop::Halt(self.x[0] as i32).into());

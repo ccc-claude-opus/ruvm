@@ -26,10 +26,14 @@ tools/linux/fetch-debian.sh && tools/linux/mkroot.sh      # Debian kernels + a s
 **Run a single program** (like `spike pk` / `qemu-user`): `ruvm -user hello.elf [args]` runs a static Linux ELF, serving its
 system calls on the host (`tools/linux/fetch-busybox.sh` gives real glibc binaries to try; dynamically linked ones run with `-L <sysroot>`; [doc/v1.1.md](doc/v1.1.md)).
 
+**Hardware virtualization**: on an AArch64 host an AArch64 guest can run directly on the CPU instead of the interpreter, with
+`-accel hvf` (macOS, Hypervisor.framework; sign the binary once per build with `tools/hvf-sign.sh`) or `-accel kvm` (Linux).
+The board and devices stay the same; a Debian boot takes about a second ([doc/v1.2.md](doc/v1.2.md)).
+
 Other guests: `-demo hello`, bare ELF programs (`-kernel prog.elf`), MIT xv6-riscv
 (`-kernel tests/guest/prebuilt/xv6/kernel -drive file=tests/guest/prebuilt/xv6/fs.img -snapshot`), OpenSBI (`-bios`).
 Options: `-m MB`, `-smp N`, `-drive file=…[,…]`, `-snapshot`, `-rng`, `-rng-seed`, `-nic user[,hostfwd=tcp::H-:G]`,
-`-rtc`, `-no-reboot`, `-input`, `-send-after`, `-d`, `-regs`, `-icount`. `ruvm -h` lists them all.
+`-rtc`, `-no-reboot`, `-input`, `-send-after`, `-accel`, `-d`, `-regs`, `-icount`. `ruvm -h` lists them all.
 
 ## What is implemented
 
@@ -40,12 +44,13 @@ Options: `-m MB`, `-smp N`, `-drive file=…[,…]`, `-snapshot`, `-rng`, `-rng-
 | Interrupts / timer | CLINT + PLIC, Sstc | GICv2, generic timer |
 | Firmware | built-in SBI (HSM, IPI, RFENCE, PMU, reset) or OpenSBI | built-in PSCI 1.1 |
 | SMP | up to 8 harts | up to 8 CPUs (`CPU_ON`) |
+| Hardware virtualization | — | `-accel hvf` (macOS), `-accel kvm` (Linux) on AArch64 hosts |
 
 Devices (both boards): NS16550 / PL011 console, virtio-mmio block, rng and net (user-mode network stack: DHCP, DNS,
 ICMP, UDP, TCP, port forwarding), RTC, power-off and reboot. A device tree is generated for each board.
 
 **Not implemented**: RISC-V V and H, ARM EL2/EL3, SVE, pointer authentication, GICv3, PCI, graphics, JIT; in `-user` mode asynchronous signals (alarm, SIGCHLD).
-Speed is that of a plain interpreter, about 120 MIPS (see [doc/v0.8.md](doc/v0.8.md)); a Debian boot takes about a minute.
+The interpreter runs about 120 MIPS (see [doc/v0.8.md](doc/v0.8.md)); a Debian boot takes about a minute, or about a second with `-accel hvf` / `kvm`.
 
 ## Testing
 
@@ -62,6 +67,7 @@ The `#[ignore]` tests boot real Linux (they need `fetch-debian.sh` and `mkroot.s
 
 | Version | Added |
 |---|---|
+| v1.2 | hardware virtualization `-accel hvf` / `-accel kvm` ([doc/v1.2.md](doc/v1.2.md)) |
 | v1.1 | user-mode emulation `-user` ([doc/v1.1.md](doc/v1.1.md)) |
 | v1.0 | consolidation: CI script, cleanup, docs ([doc/v1.0.md](doc/v1.0.md)) |
 | v0.11 | ISA completion: FP estimates, CRC32, AES, SHA, CASP; RISC-V B, Zicond, Zicbo\*, Svinval, Sv48, PMP ([doc/v0.11.md](doc/v0.11.md)) |

@@ -5,7 +5,7 @@ use ruvm::{demo, is_linux_image, Arch, LinuxBoot, Machine, Stop};
 use std::process::exit;
 
 const USAGE: &str = "\
-ruvm 1.1 — a tiny QEMU-like emulator (RISC-V 64 / AArch64)
+ruvm 1.2 — a tiny QEMU-like emulator (RISC-V 64 / AArch64)
 
 USAGE:
     ruvm -M <riscv64|aarch64> (-kernel <file> | -demo hello) [options]
@@ -34,9 +34,12 @@ OPTIONS:
     -rtc <secs>                   start the RTC at this Unix time (default: host clock)
     -nic user[,hostfwd=tcp::H-:G] virtio-net with a user-mode network (guest 10.0.2.15, gateway/host 10.0.2.2, DNS 10.0.2.3)
     -no-reboot                    exit instead of rebooting when the guest resets
-    -smp <n>                      number of CPUs (1-8, scheduled round-robin; default 1)
+    -smp <n>                      number of CPUs (1-8, default 1; round-robin on one thread, or one thread each with -accel)
     -input <text>                 type <text> on the guest console at start (\\n = newline)
     -send-after <pattern> <text>  type <text> once the console has printed <pattern> (repeatable)
+    -accel <tcg|hvf|kvm>          how to run the guest: tcg = ruvm's interpreter (default); hvf / kvm =
+                                  the host's hypervisor (AArch64 guest on an AArch64 macOS / Linux host),
+                                  guest code runs natively. hvf needs a signed binary (tools/hvf-sign.sh)
     -icount <N>                   stop after N instructions
     -d, --trace                   trace every instruction (pc + raw word) to stderr
     -regs                         dump CPU registers on exit
@@ -54,6 +57,10 @@ GUEST EXIT:
     aarch64   HVC/SMC PSCI SYSTEM_OFF (x0=0x84000008), HLT, or SVC x8=93 (exit) when VBAR_EL1==0
 ";
 
+fn v_name(a: ruvm::accel::Accel) -> String {
+    format!("{a:?}").to_lowercase()
+}
+
 fn die(msg: &str) -> ! {
     eprintln!("ruvm: {msg}");
     exit(64);
@@ -69,6 +76,7 @@ fn main() {
     let (mut rng, mut rng_seed, mut rtc, mut no_reboot) = (false, None, None, false);
     let mut nic: Option<(Vec<HostFwd>, [u8; 6])> = None;
     let mut smp = 1usize;
+    let mut accel = ruvm::accel::Accel::Tcg;
     let (mut snapshot, mut input) = (false, String::new());
     let mut expects: Vec<(String, String)> = Vec::new();
     let (mut initrd, mut append, mut bios, mut dumpdtb) = (None, String::new(), None, None);
@@ -97,6 +105,10 @@ fn main() {
             "-m" => {
                 ram = val("-m").parse().unwrap_or_else(|_| die("-m expects a number of MiB"));
                 ram_set = true;
+            }
+            "-accel" => {
+                let v = val("-accel");
+                accel = ruvm::accel::Accel::parse(v.split(',').next().unwrap_or("")).unwrap_or_else(|| die("-accel expects tcg, hvf or kvm"));
             }
             "-icount" => icount = Some(val("-icount").parse().unwrap_or_else(|_| die("bad -icount"))),
             "-d" | "--trace" => trace = true,
@@ -197,6 +209,15 @@ fn main() {
     let mut vm = Machine::with_cpus(arch, ram, interactive, smp);
     vm.set_rtc_epoch(rtc);
     vm.trace = trace;
+    if accel != ruvm::accel::Accel::Tcg {
+        if arch != Arch::Aarch64 || ruvm::accel::Accel::native() != Some(accel) {
+            die(&format!("-accel {} is not available here (it runs AArch64 guests on an AArch64 {} host)", v_name(accel), if accel == ruvm::accel::Accel::Hvf { "macOS" } else { "Linux" }));
+        }
+        if icount.is_some() {
+            die("-icount needs the interpreter (-accel tcg)");
+        }
+        vm.accel = accel;
+    }
     vm.send_input(input.as_bytes());
     for (pat, text) in &expects {
         vm.send_input_after(pat.as_bytes(), text.as_bytes());

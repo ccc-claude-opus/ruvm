@@ -15,7 +15,7 @@ impl fmt::Display for BusError {
 }
 
 /// A memory-mapped device. Offsets are relative to the device base.
-pub trait Device {
+pub trait Device: Send {
     fn read(&mut self, off: u64, size: usize) -> u64;
     fn write(&mut self, off: u64, size: usize, val: u64);
     /// If the guest asked the machine to power off, return the exit code.
@@ -77,6 +77,55 @@ impl Dma<'_> {
     }
 }
 
+/// Guest RAM: zeroed and aligned to 64 KiB, so that a hypervisor can map it into a VM
+/// (host pages are 4, 16 or 64 KiB).
+pub struct Ram {
+    ptr: std::ptr::NonNull<u8>,
+    len: usize,
+}
+
+impl Ram {
+    const ALIGN: usize = 64 << 10;
+
+    fn new(len: usize) -> Ram {
+        if len == 0 {
+            return Ram { ptr: std::ptr::NonNull::dangling(), len };
+        }
+        let layout = std::alloc::Layout::from_size_align(len, Self::ALIGN).expect("RAM size");
+        // SAFETY: the layout has a non-zero size.
+        let p = unsafe { std::alloc::alloc_zeroed(layout) };
+        let ptr = std::ptr::NonNull::new(p).unwrap_or_else(|| std::alloc::handle_alloc_error(layout));
+        Ram { ptr, len }
+    }
+}
+
+impl Drop for Ram {
+    fn drop(&mut self) {
+        if self.len != 0 {
+            // SAFETY: allocated in `Ram::new` with this layout.
+            unsafe { std::alloc::dealloc(self.ptr.as_ptr(), std::alloc::Layout::from_size_align_unchecked(self.len, Self::ALIGN)) }
+        }
+    }
+}
+
+impl std::ops::Deref for Ram {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        // SAFETY: `len` zero-initialised bytes owned by `self`.
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+impl std::ops::DerefMut for Ram {
+    fn deref_mut(&mut self) -> &mut [u8] {
+        // SAFETY: as above, and `&mut self` is unique.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), self.len) }
+    }
+}
+
+// SAFETY: `Ram` owns its allocation like a `Vec<u8>`.
+unsafe impl Send for Ram {}
+
 struct Mapping {
     base: u64,
     size: u64,
@@ -102,7 +151,7 @@ pub struct CpuCtl {
 
 pub struct Bus {
     ram_base: u64,
-    ram: Vec<u8>,
+    ram: Ram,
     devs: Vec<Mapping>,
     /// Machine timer + software interrupts. `clint.mtime` is the board's time base
     /// (one tick per executed instruction) and is also used for the ARM generic timer.
@@ -144,7 +193,7 @@ impl Bus {
     pub fn with_cpus(ram_base: u64, ram_size: usize, ncpus: usize) -> Self {
         Bus {
             ram_base,
-            ram: vec![0; ram_size],
+            ram: Ram::new(ram_size),
             devs: Vec::new(),
             clint: Clint::new(ncpus),
             clint_base: None,
@@ -218,6 +267,11 @@ impl Bus {
                 self.ram_base + self.ram_size()
             )),
         }
+    }
+
+    /// Start of guest RAM in host memory (for mapping it into a hardware VM).
+    pub fn ram_ptr(&mut self) -> *mut u8 {
+        self.ram.ptr.as_ptr()
     }
 
     /// Guest RAM as a byte slice (fast paths that already know an address is RAM).
@@ -330,8 +384,16 @@ impl Bus {
             return;
         }
         for m in &mut self.devs {
-            m.dev.poll(&mut Dma { ram: &mut self.ram, base: self.ram_base });
-            if m.irq != 0 {
+            if m.irq == 0 {
+                m.dev.poll(&mut Dma { ram: &mut self.ram, base: self.ram_base });
+                continue;
+            }
+            // sample the line before and after the device's asynchronous work, so that a drop
+            // (the driver acknowledged) followed by new work is seen as a new edge
+            for k in 0..2 {
+                if k == 1 {
+                    m.dev.poll(&mut Dma { ram: &mut self.ram, base: self.ram_base });
+                }
                 let level = m.dev.irq();
                 if plic {
                     self.plic.set_level(m.irq, level);
@@ -368,3 +430,4 @@ impl Bus {
         self.halt
     }
 }
+

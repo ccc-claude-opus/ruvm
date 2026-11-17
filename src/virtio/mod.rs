@@ -11,6 +11,7 @@ pub mod net;
 pub mod rng;
 
 use crate::bus::{Device, Dma};
+use std::sync::atomic::{fence, Ordering};
 
 const MAGIC: u32 = 0x7472_6976; // "virt"
 const VENDOR: u32 = 0x554d_4551; // "QEMU"
@@ -37,7 +38,7 @@ pub enum Done {
 }
 
 /// A virtio device back-end.
-pub trait Backend {
+pub trait Backend: Send {
     fn device_id(&self) -> u32;
     /// Device feature bits (VIRTIO_F_VERSION_1 is added by the transport).
     fn features(&self) -> u64 {
@@ -136,6 +137,9 @@ impl VirtioMmio {
             let num = q.num as u64;
             let mut last = q.last_avail;
             let Some(avail_idx) = mem.r16(q.avail + 2) else { continue };
+            // with a hardware accelerator the driver runs concurrently on other host cores:
+            // read the ring entries and descriptors only after the index that published them
+            fence(Ordering::Acquire);
             while last != avail_idx {
                 let Some(head) = mem.r16(q.avail + 4 + 2 * (last as u64 % num)) else { break };
                 let Some(chain) = Self::chain(&q, mem, head) else { break };
@@ -147,6 +151,7 @@ impl VirtioMmio {
                 let e = q.used + 4 + 8 * (used_idx as u64 % num);
                 mem.w32(e, head as u32);
                 mem.w32(e + 4, len);
+                fence(Ordering::Release); // the data and the used element before the index
                 mem.w16(q.used + 2, used_idx.wrapping_add(1));
                 last = last.wrapping_add(1);
                 self.int_status |= 1;
