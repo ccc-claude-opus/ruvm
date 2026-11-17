@@ -29,7 +29,8 @@ OPTIONS:
     -m <MiB>                      RAM size in MiB (default 128)
     -drive file=<img>[,...]       raw disk image as virtio-mmio block device (writes go to the file)
     -drive file=<img> may be repeated (virtio-blk devices in order, then virtio-rng)
-    -snapshot                     keep disk writes in memory (image file is not modified)
+    -drive file=<img>,snapshot=on keep this disk's writes in memory (the other drives still write to their files)
+    -snapshot                     keep disk writes in memory for every drive (image files are not modified)
     -rng, -rng-seed <n>           attach a virtio-rng device (fixed seed for reproducible runs)
     -rtc <secs>                   start the RTC at this Unix time (default: host clock)
     -nic user[,hostfwd=tcp::H-:G] virtio-net with a user-mode network (guest 10.0.2.15, gateway/host 10.0.2.2, DNS 10.0.2.3)
@@ -72,7 +73,7 @@ fn main() {
     let mut user: Option<(String, Vec<String>)> = None;
     let mut sysroot: Option<String> = None;
     let mut ram_set = false;
-    let mut drives: Vec<String> = Vec::new();
+    let mut drives: Vec<(String, bool)> = Vec::new();
     let (mut rng, mut rng_seed, mut rtc, mut no_reboot) = (false, None, None, false);
     let mut nic: Option<(Vec<HostFwd>, [u8; 6])> = None;
     let mut smp = 1usize;
@@ -100,7 +101,8 @@ fn main() {
                 let v = val("-drive");
                 // accept QEMU syntax: file=fs.img,if=none,format=raw,...
                 let file = v.split(',').find_map(|kv| kv.strip_prefix("file=")).unwrap_or(&v).to_string();
-                drives.push(file);
+                let snap = v.split(',').any(|kv| matches!(kv, "snapshot=on" | "snapshot=true" | "snapshot"));
+                drives.push((file, snap));
             }
             "-m" => {
                 ram = val("-m").parse().unwrap_or_else(|_| die("-m expects a number of MiB"));
@@ -222,8 +224,8 @@ fn main() {
     for (pat, text) in &expects {
         vm.send_input_after(pat.as_bytes(), text.as_bytes());
     }
-    for path in &drives {
-        if let Err(e) = vm.attach_disk(path, snapshot) {
+    for (path, snap) in &drives {
+        if let Err(e) = vm.attach_disk(path, snapshot || *snap) {
             die(&e);
         }
     }

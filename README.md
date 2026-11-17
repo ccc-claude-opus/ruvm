@@ -32,7 +32,7 @@ The board and devices stay the same; a Debian boot takes about a second ([doc/v1
 
 Other guests: `-demo hello`, bare ELF programs (`-kernel prog.elf`), MIT xv6-riscv
 (`-kernel tests/guest/prebuilt/xv6/kernel -drive file=tests/guest/prebuilt/xv6/fs.img -snapshot`), OpenSBI (`-bios`).
-Options: `-m MB`, `-smp N`, `-drive file=…[,…]`, `-snapshot`, `-rng`, `-rng-seed`, `-nic user[,hostfwd=tcp::H-:G]`,
+Options: `-m MB`, `-smp N`, `-drive file=…[,snapshot=on]`, `-snapshot`, `-rng`, `-rng-seed`, `-nic user[,hostfwd=tcp::H-:G]`,
 `-rtc`, `-no-reboot`, `-input`, `-send-after`, `-accel`, `-d`, `-regs`, `-icount`. `ruvm -h` lists them all.
 
 ## What is implemented
