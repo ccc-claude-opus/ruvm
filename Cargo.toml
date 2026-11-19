@@ -4,6 +4,7 @@ version = "1.2.0"
 edition = "2021"
 description = "A tiny QEMU-like machine emulator written in Rust (RISC-V 64 / AArch64)"
 license = "MIT"
+repository = "https://github.com/ccc-claude-opus/ruvm"
 
 [lib]
 name = "ruvm"
